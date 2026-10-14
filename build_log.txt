@@ -1,0 +1,8 @@
+[..] compiling
+main.cpp
+window.cpp
+wic.cpp
+runner.cpp
+tray.cpp
+正在生成代码...
+[OK] build\bin\FalcomDeskling.exe
