@@ -135,6 +135,24 @@ bool DecodePngStrip(const wchar_t* path, Strip& out) {
     return ok;
 }
 
+StripCache& StripCache::Shared() {
+    static StripCache c;
+    return c;
+}
+
+// 按字节淘汰最久没用的那一份。只放掉缓存自己那份引用，外面还攥着的
+// shared_ptr 继续有效，也不会像裸指针那样被 erase 挪到别的槽位上去
+void StripCache::Trim() {
+    while (_bytes > _budget && _items.size() > 1) {
+        size_t victim = 0;
+        for (size_t i = 1; i < _items.size(); ++i) {
+            if (_items[i].last < _items[victim].last) victim = i;
+        }
+        _bytes -= _items[victim].bytes;
+        _items.erase(_items.begin() + (long)victim);
+    }
+}
+
 StripPtr StripCache::Get(const std::wstring& path) {
     for (size_t i = 0; i < _items.size(); ++i) {
         if (_items[i].path == path) {
@@ -146,37 +164,69 @@ StripPtr StripCache::Get(const std::wstring& path) {
     StripPtr s = std::make_shared<Strip>();
     if (!DecodePngStrip(path.c_str(), *s)) return nullptr;
 
-    if (_items.size() >= kMax) {
-        size_t victim = 0;
-        for (size_t i = 1; i < _items.size(); ++i) {
-            if (_items[i].last < _items[victim].last) victim = i;
-        }
-        // 只放掉缓存自己那份引用。外面还攥着的 shared_ptr 继续有效，
-        // 也不会像裸指针那样被 erase 挪到别的槽位上去
-        _items.erase(_items.begin() + (long)victim);
-    }
-
-    _items.push_back(Entry{ path, std::move(s), ++_clock });
+    const size_t bytes = s->pixels.size() * 4;
+    _items.push_back(Entry{ path, std::move(s), ++_clock, bytes });
+    _bytes += bytes;
+    Trim();
     return _items.back().strip;
 }
 
-size_t StripCache::Bytes() const {
-    size_t n = 0;
-    for (const Entry& e : _items) {
-        if (e.strip) n += e.strip->pixels.size() * 4;
+// ---- 动作集 ----
+const wchar_t* FolderOf(Art a) {
+    switch (a) {
+        case Art::Run:     return L"1.Run";
+        case Art::Walk:    return L"2.Walk";
+        case Art::Standby: return L"4.standby";
+        case Art::Run2:    return L"5.run2";
     }
-    return n;
+    return L"2.Walk";
+}
+
+bool HasWalkSet(const std::wstring& dir) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    return fs::is_regular_file(fs::path(dir) / L"2.Walk" / L"dir0.png", ec);
+}
+
+// 排过序的一遍名单。判据走宽松那一档：有 2.Walk 就认这个人，缺哪个动作
+// 就那个动作不可用 —— 别因为一套图里少一张就把这个人整个跳过
+std::vector<SkinInfo> ScanSkins(const std::wstring& root) {
+    namespace fs = std::filesystem;
+    std::vector<SkinInfo> found;
+    std::error_code ec;
+    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_directory(ec)) continue;
+        const fs::path p = it->path();
+        const std::wstring leaf = p.filename().wstring();
+        // 这几个不是人：老摆法摊在旁边的敌人和资源目录
+        if (leaf == L"Enemy" || leaf == L"Resource" || leaf == L"Chr") continue;
+        if (!HasWalkSet(p.wstring())) continue;
+
+        SkinInfo si;
+        si.name = leaf;
+        si.dir = p.wstring();
+        si.hasStandby = fs::is_regular_file(p / L"5.run2" / L"dir0.png", ec) &&
+                        fs::is_regular_file(p / L"4.standby" / L"dir0.png", ec);
+        found.push_back(si);
+    }
+    std::sort(found.begin(), found.end(),
+              [](const SkinInfo& a, const SkinInfo& b) { return a.name < b.name; });
+    return found;
 }
 
 // 开机扫一遍全部条带求并集框。一条一条解，解完就扔，峰值内存只有一条的量
 bool ComputeSkinBBox(const std::wstring& skinDir, BBox& out) {
     namespace fs = std::filesystem;
-    const wchar_t* folders[] = { L"1.Run", L"2.Walk" };
     int minX = INT_MAX, minY = INT_MAX, maxX = -1, maxY = -1;
     int cellW = 0, cellH = 0;
     int seen = 0;
 
-    for (const wchar_t* folder : folders) {
+    // 不写死目录列表：扫 skinDir 下所有存在的动作夹。武器那两套的图必须也
+    // 进这个并集，否则那个动作的内容会超出框被无声裁掉
+    for (int a = 0; a < ART_COUNT; ++a) {
+        const std::wstring folder = FolderOf(static_cast<Art>(a));
+        std::error_code ec;
+        if (!fs::is_directory(fs::path(skinDir) / folder, ec)) continue;
         for (int d = 0; d < DIR_COUNT; ++d) {
             const std::wstring p =
                 (fs::path(skinDir) / folder / (L"dir" + std::to_wstring(d) + L".png")).wstring();

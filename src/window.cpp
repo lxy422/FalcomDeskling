@@ -35,8 +35,9 @@ LRESULT LayeredWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_DESTROY:
+        // 这里不许再 PostQuitMessage：多角色时"删掉一个人"会走 DestroyWindow，
+        // 那等于把整个程序一起关了。退出只从托盘那条路来
         _hwnd = nullptr;
-        PostQuitMessage(0);
         return 0;
     case WM_WINDOWPOSCHANGED: {
         // 被别的窗口挪过就别再拿旧坐标做差分了

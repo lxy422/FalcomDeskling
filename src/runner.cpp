@@ -8,10 +8,8 @@
 namespace fd {
 
 namespace {
-// SpriteSheet.vb:114-135 —— 目录名只在这一张表里出现
-const wchar_t* FolderOf(State st) {
-    return st == State::Run ? L"1.Run" : L"2.Walk";
-}
+// 目录名那张表搬到 wic.cpp 的 FolderOf(Art) 去了：现在取哪套动作不只取决于
+// 走还是跑，还取决于有没有装备武器，一个 State 说不清
 
 inline uint64_t NowUs() {
     static LARGE_INTEGER f = [] {
@@ -41,8 +39,13 @@ bool Runner::Create(LayeredWindow* win, const Options& opt) {
     _worldW = opt.worldW;
     _worldH = opt.worldH;
 
+    // 桌上站好几个人时，它们是在几毫秒之内连着构造的。光拿 tick 混种子，
+    // 几个人的随机序列会高度相关 —— 表现为两个人同时往同一个方向走、
+    // 或者同时撞同一面墙。把窗口指针和 this 都搅进去，地址天然不一样
     std::random_device rd;
-    _rng.seed(rd() ^ static_cast<uint32_t>(GetTickCount64()));
+    const uint32_t addr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(win) >> 8) ^
+                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(this) << 1);
+    _rng.seed(rd() ^ static_cast<uint32_t>(GetTickCount64()) ^ addr);
 
     // 开机扫一遍全部条带求并集框。这一步只解码不缓存，峰值内存还是一条的量。
     // 必须排在挑出生点之前：可行走区是从 _box 推出来的，框还没算出来就夹位置，
@@ -55,6 +58,7 @@ bool Runner::Create(LayeredWindow* win, const Options& opt) {
     _dir = RandDir(_rng);
     if (_opt.forceDir >= 0 && _opt.forceDir < DIR_COUNT) _dir = _opt.forceDir;
     _state = State::Walk;
+    _armed = false;
 
     // 落在可行走区里随便一个点上，别一上来就贴着墙
     const double clr = Clearance();
@@ -106,6 +110,13 @@ void Runner::Tick(double dt, Vec2 mouse) {
 // 规则 4 的迟滞：追进 2 个身长开跑，退到 4 个身长才换回走路
 void Runner::UpdateState(double dt, double dist) {
     (void)dt;
+    // 拿了剑就不走路：WpfTest 那边是 SetArmed 里直接把状态摁成 Run，这里照做。
+    // 不然会出现"用待机那套图在走"——待机是站定的动作，画出来就是脚不沾地
+    // 在地上滑
+    if (_armed) {
+        if (_state != State::Run) SetState(State::Run);
+        return;
+    }
     const double runIn = RUN_START_LEN * BodyLen();
     const double runOut = RUN_END_LEN * BodyLen();
     if (_state == State::Walk) {
@@ -126,6 +137,20 @@ void Runner::SetState(State st) {
     _animClock = 0.0;
     _frameIndex = -1;
     LoadFrames();
+}
+
+// 装备武器只换动作集和腿速，不动状态机：走/跑那套迟滞照旧在跑。
+// 缺武器图的人这里直接吞掉 —— 托盘那个勾是全局的，不能因为一个人没图
+// 就整条命令报错，或者让他黑一块
+void Runner::SetArmed(bool flag) {
+    if (flag && !_opt.hasWeaponArt) flag = false;
+    if (_armed == flag) return;
+    _armed = flag;
+    // 换了动作集就是换了一批条带，帧号得重头数，不然会拿走跑的帧号去套武器跑
+    _animClock = 0.0;
+    _frameIndex = -1;
+    LoadFrames();
+    _needUpload = true;
 }
 
 void Runner::SetDirection(int dir) {
@@ -243,7 +268,15 @@ void Runner::UpdateFrame(double dt) {
         return;
     }
     _animClock += dt;
-    const double rate = (_state == State::Run) ? RUN_FPS : WALK_FPS;
+    // 帧率按动作集取，不是按走/跑：武器跑比无武器跑慢一档，照搬那两个数
+    // 会让剑影糊成一团
+    double rate = WALK_FPS;
+    switch (ArtOf()) {
+        case Art::Run:     rate = RUN_FPS;     break;
+        case Art::Standby: rate = STANDBY_FPS; break;
+        case Art::Run2:    rate = RUN2_FPS;    break;
+        case Art::Walk:    rate = WALK_FPS;    break;
+    }
     const int idx = (int)std::fmod(std::floor(_animClock * rate), (double)_frameCount);
     if (idx != _frameIndex) {
         _frameIndex = idx;
@@ -251,10 +284,10 @@ void Runner::UpdateFrame(double dt) {
     }
 }
 
-std::wstring Runner::StripPath(State st, int dir) const {
+std::wstring Runner::StripPath(Art a, int dir) const {
     std::wstring p = _opt.skinDir;
     p += L'\\';
-    p += FolderOf(st);
+    p += FolderOf(a);
     p += L"\\dir";
     p += std::to_wstring(dir);
     p += L".png";
@@ -262,7 +295,7 @@ std::wstring Runner::StripPath(State st, int dir) const {
 }
 
 void Runner::LoadFrames() {
-    const std::wstring path = StripPath(_state, _dir);
+    const std::wstring path = StripPath(ArtOf(), _dir);
     if (path == _stripPath && _strip) return;
 
     StripPtr s = _cache.Get(path);

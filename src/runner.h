@@ -11,11 +11,15 @@
 namespace fd {
 
 // 一个坐在桌面上乱走的人：位置、方向、状态机、撞墙挑向全在这儿。
-// 逻辑照搬 RunnerEntity.vb，只砍掉了 Phase 1 用不到的那几支（武器/遭遇/跪姿/表情）。
+// 逻辑照搬 RunnerEntity.vb，只砍掉了 Phase 1 用不到的那几支（遭遇/跪姿/表情）。
+// 武器这一档这轮只做手动开关，自动抽剑/收剑那套要等敌人系统，先不写。
 class Runner {
 public:
     struct Options {
         std::wstring skinDir;   // ...\Chr\科洛丝
+        // 这套皮肤有没有武器那两套图。没有的话 SetArmed 会退回走/跑，
+        // 免得兴冲冲切过去却去开一个不存在的文件
+        bool hasWeaponArt = false;
         double k = 1.0;         // scale * dpiScale，身长/半宽/脚底都从它现算
         double dpi = 1.0;       // dpiScale，把 DIU 常量换算成物理像素
         bool wander = false;    // 走路时也每隔 1.5 秒自己换向
@@ -64,6 +68,17 @@ public:
     State GetState() const { return _state; }
     int Dir() const { return _dir; }
     Vec2 Pos() const { return _pos; }
+    // 全局装备开关会逐个叫到每个 Runner 头上。缺武器图的时候这里自己吞掉，
+    // 不报错也不崩 —— 托盘那个勾还是全局的，只是这个人没得可换
+    void SetArmed(bool flag);
+    bool Armed() const { return _armed; }
+    // 这个人到底有没有武器图，供托盘标"缺武器"用
+    bool HasWeaponArt() const { return _opt.hasWeaponArt; }
+    // 现在这一拍在放哪套动作，取图的路径只从这里出
+    Art ArtOf() const {
+        if (_armed) return (_state == State::Run) ? Art::Run2 : Art::Standby;
+        return (_state == State::Run) ? Art::Run : Art::Walk;
+    }
     // 身长按皮肤自己的格径缩放：82 是按 256 格定的，换成 512 格就该是 164
     double BodyLen() const { return SPRITE_BODY_HEIGHT * _k * CellScale(); }
 
@@ -121,7 +136,11 @@ private:
     int WeightedPick(const std::vector<int>& ranked);
 
     double CurrentSpeedPx() const {
-        return (_state == State::Run ? RUN_PX : WALK_PX) * _k * 0.5;
+        // 带武器跑用另一条腿速：300 和 900 之间取 520，不然拿了剑反而像在冰上滑
+        if (_state == State::Run) {
+            return (_armed ? ARMED_RUN_PX : RUN_PX) * _k * 0.5;
+        }
+        return WALK_PX * _k * 0.5;
     }
     // 窗口从"脚底锚点"往四个方向各伸出多少物理像素。这四个数全部从 _box 现推：
     // 窗口原点 = 脚底 + (box.y - 脚底线)，所以 box 的四条边就是窗口在屏幕上的
@@ -171,7 +190,7 @@ private:
     double CenterY() const { return _oy + _worldH * 0.5; }
     bool BodyHit(Vec2 mouse) const;
     double BodyDistance(Vec2 mouse) const;
-    std::wstring StripPath(State st, int dir) const;
+    std::wstring StripPath(Art a, int dir) const;
     void LoadFrames();
     void Blit();
     // 窗口尺寸和锚点唯一的来源。全局框求不出来才退回单条的框
@@ -198,11 +217,15 @@ private:
 
     LayeredWindow* _win = nullptr;
     Options _opt;
-    StripCache _cache;
+    // 缓存不再是成员：进程里就一份，两个人用同一张图就只解一次
+    StripCache& _cache = StripCache::Shared();
 
     Vec2 _pos{};
     Vec2 _mouse{};
     State _state = State::Walk;
+    // 装备武器是个开关，不是状态机里的一态：它只换动作集和腿速，
+    // 走/跑的迟滞那套照旧在跑
+    bool _armed = false;
     int _dir = 0;
     int _frameIndex = -1;
     int _frameCount = 0;
