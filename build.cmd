@@ -34,10 +34,32 @@ if not exist "%OUT%\obj" mkdir "%OUT%\obj"
 if not exist "%OUT%\bin" mkdir "%OUT%\bin"
 
 echo [..] compiling
-cl /nologo /std:c++17 /EHsc /utf-8 /W3 /DUNICODE /D_UNICODE %OPTS% /Fo"%OUT%\obj\\" "%SRC%\main.cpp" "%SRC%\window.cpp" "%SRC%\wic.cpp" "%SRC%\runner.cpp" "%SRC%\tray.cpp" /link /SUBSYSTEM:WINDOWS /OUT:"%EXE%" user32.lib gdi32.lib shell32.lib windowscodecs.lib ole32.lib oleaut32.lib
+cl /nologo /std:c++17 /EHsc /utf-8 /W3 /DUNICODE /D_UNICODE %OPTS% /Fo"%OUT%\obj\\" "%SRC%\main.cpp" "%SRC%\window.cpp" "%SRC%\wic.cpp" "%SRC%\runner.cpp" "%SRC%\tray.cpp" "%SRC%\store.cpp" "%SRC%\emote.cpp" "%SRC%\charconf.cpp" "%SRC%\xml.cpp" /link /SUBSYSTEM:WINDOWS /OUT:"%EXE%" user32.lib gdi32.lib shell32.lib windowscodecs.lib ole32.lib oleaut32.lib
 if errorlevel 1 goto fail
 
 if exist "resource\falcom.ico" copy /y "resource\falcom.ico" "%OUT%\bin\falcom.ico" >nul
+
+rem ---------- resource junctions ----------
+rem chr\ and Enemy\ live OUTSIDE the exe: the program only looks next to it, so
+rem the build has to put something there. mklink /J needs no admin rights.
+rem
+rem %~dp0 is this batch file's own directory, so the source is right no matter
+rem what cwd the caller used. The art itself still lives in the sibling WpfTest
+rem checkout - this repo keeps no copies of those 16MB.
+set CHRSRC=%~dp0..\WpfTest\Resource\Chr
+set ENEMYSRC=%~dp0..\WpfTest\Resource\Enemy
+if not exist "%OUT%\bin\chr" (
+  if exist "%CHRSRC%" (
+    mklink /J "%OUT%\bin\chr" "%CHRSRC%" >nul
+  ) else (
+    echo [!] chr\ source not found at %CHRSRC% - the program will refuse to start
+  )
+)
+if not exist "%OUT%\bin\Enemy" (
+  if exist "%ENEMYSRC%" (
+    mklink /J "%OUT%\bin\Enemy" "%ENEMYSRC%" >nul
+  )
+)
 echo [OK] %EXE%
 endlocal
 exit /b 0

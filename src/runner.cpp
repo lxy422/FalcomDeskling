@@ -3,9 +3,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 
 namespace fd {
+
+// 桌上都有谁。名单是 main 的，Runner 只看不改
+const std::vector<Runner*>* Runner::s_peers = nullptr;
+bool Runner::s_separate = true;
 
 namespace {
 // 目录名那张表搬到 wic.cpp 的 FolderOf(Art) 去了：现在取哪套动作不只取决于
@@ -32,6 +37,8 @@ bool Runner::Create(LayeredWindow* win, const Options& opt) {
     if (!win || !win->Valid()) return false;
     _win = win;
     _opt = opt;
+    // 配置从缓存里现取，这里只留目录名。见 runner.h 上 Cfg() 那条注释
+    _cfgDir = opt.skinDir;
     _k = opt.k;
     _dpi = opt.dpi;
     _ox = opt.ox;
@@ -58,6 +65,19 @@ bool Runner::Create(LayeredWindow* win, const Options& opt) {
     _dir = RandDir(_rng);
     if (_opt.forceDir >= 0 && _opt.forceDir < DIR_COUNT) _dir = _opt.forceDir;
     _state = State::Walk;
+    // --state= 钉住这一态。它得在建起来的第一拍就生效，晚一拍表就会把它换走
+    _stateLocked = false;
+    if (_opt.forceState >= 0 && _opt.forceState < STATE_COUNT) {
+        _state = (State)_opt.forceState;
+        _stateLocked = true;
+    }
+    _stateClock = 0.0;
+    _stateLimit = StateHold(_state);
+    _returnTo = _state;
+    _stats.state = (int)_state;
+    _stats.stateChanges = 0;
+    // 探针从命令行接进来，起步就给它一点余量，别第一拍就动手
+    _hitProbe = _opt.hitProbe ? HIT_PROBE_SEC : 0.0;
     _armed = false;
 
     // 落在可行走区里随便一个点上，别一上来就贴着墙
@@ -85,6 +105,39 @@ void Runner::Tick(double dt, Vec2 mouse) {
     if (_bounceCool > 0) _bounceCool -= dt;
     if (_dirLock > 0) _dirLock -= dt;
     if (_touchCool > 0) _touchCool -= dt;
+    // 同伴那两条是秒表不是一拍计数：躲一次和挤一次谁也不该压着谁不放
+    if (_peerCool > 0) _peerCool -= dt;
+    if (_peerLogCool > 0) _peerLogCool -= dt;
+    if (_hitCool > 0) _hitCool -= dt;
+    // --hit=：桌上第一个人隔一会儿打后面的人一下。测试得让它稳定地打得到，
+    // 太快就全糊在冷却里了
+    // 探针只让名单里第一个去发。人人都发就成了八×八次互殴，
+    // "谁挨了这一下"当场就说不清了
+    if (_hitProbe > 0) {
+        _hitProbe -= dt;
+        if (_hitProbe <= 0) {
+            _hitProbe = HIT_PROBE_SEC;
+            if (s_peers && !s_peers->empty() && s_peers->front() == this) {
+                for (const Runner* o : *s_peers) {
+                    if (!o || o == this) continue;
+                    const_cast<Runner*>(o)->Hit(const_cast<Runner*>(this));
+                    break;
+                }
+            }
+        }
+    }
+
+    // ---- 任务栏漫步 ----
+    //
+    // 这一档整条走自己的路：鼠标、同伴、遭遇表、撞墙那套全都不接。
+    // 拿 if 去每个函数里挡一遍迟早会漏一处 —— 比如 BodyHit 那一下弹开，
+    // 或者 SeparateAll 把两个人推开 —— 所以在这里一次分岔，底下全跳过
+    if (_opt.taskbar) {
+        UpdateTaskbar(dt);
+        UpdateFrame(dt);
+        _bubble.Tick(dt, _pos, HeadTop(), _k, FaceLeft());
+        return;
+    }
 
     // 时间到还不算，得真让开那条边才放锁；正往这条边回冲的时候也不许放
     if (_lockEdge != 0 && _dirLock <= 0 && ClearOfEdge(_lockEdge) &&
@@ -98,18 +151,29 @@ void Runner::Tick(double dt, Vec2 mouse) {
     // 规则 3：被鼠标蹭到，就往当前朝向的反方向 ±45 度弹开
     if (_touchCool <= 0 && BodyHit(mouse)) {
         FlickAway();
-        _touchCool = TOUCH_COOLDOWN_SEC;
+        _touchCool = Cfg().touchCoolSec.valueOr(TOUCH_COOLDOWN_SEC);
+        Emit(GameEvent::Touched);
     }
 
     UpdateState(dt, dist);
+    UpdateEncounter(dt);
+    UpdateChase(dt);
+    TickState(dt);
     UpdateFlee(dt);
     Move(dt);
     UpdateFrame(dt);
+
+    // 泡泡排在最后：它得跟着这一拍真的脚底和头顶走，早一拍就是上一拍的位置
+    _bubble.Tick(dt, _pos, HeadTop(), _k, FaceLeft());
 }
 
 // 规则 4 的迟滞：追进 2 个身长开跑，退到 4 个身长才换回走路
 void Runner::UpdateState(double dt, double dist) {
     (void)dt;
+    // 迟滞只管走/跑这两态。人要是被表叫去追人、挨打、歇着，这里一句都不许插嘴
+    if (_stateLocked) return;
+    if (_state != State::Walk && _state != State::Run) return;
+
     // 拿了剑就不走路：WpfTest 那边是 SetArmed 里直接把状态摁成 Run，这里照做。
     // 不然会出现"用待机那套图在走"——待机是站定的动作，画出来就是脚不沾地
     // 在地上滑
@@ -117,26 +181,192 @@ void Runner::UpdateState(double dt, double dist) {
         if (_state != State::Run) SetState(State::Run);
         return;
     }
-    const double runIn = RUN_START_LEN * BodyLen();
-    const double runOut = RUN_END_LEN * BodyLen();
+    const double runIn = Cfg().nearLen.valueOr(RUN_START_LEN) * BodyLen();
+    const double runOut = Cfg().farLen.valueOr(RUN_END_LEN) * BodyLen();
+    const State before = _state;
     if (_state == State::Walk) {
         if (dist < runIn) SetState(State::Run);
     } else {
         if (dist > runOut && _runTravel >= runOut) SetState(State::Walk);
     }
+    // 换态在这儿，报脸也在这儿：EnterState 不该自己发事件，那是 Emit 的活。
+    // 走 EmitPhysical 而不是 Emit —— 这套迟滞带着 _runTravel 这个条件，
+    // 表里同一件事再驱动一遍就成了两处说法
+    if (_state == before) return;
+    if (_state == State::Run) EmitPhysical(GameEvent::MouseNear);
+    else EmitPhysical(GameEvent::MouseFar);
 }
 
-void Runner::SetState(State st) {
+void Runner::SetState(State st) { EnterState(st, false); }
+
+// 换态。fromRule=true 是转移表叫来的，得把"从哪儿来"记下来 —— 一次性动画
+// 放完要回这儿。物理那边自己换的（走/跑那套迟滞）不许碰这个字段：
+// 那是它自己的事，跟"挨一下之后回哪儿"无关
+void Runner::EnterState(State st, bool fromRule) {
     if (_state == st) return;
+    if (fromRule) _returnTo = _state;
     _state = st;
+    ++_stats.stateChanges;
+    _stats.state = (int)st;
+    _stateClock = 0.0;
+    _stateLimit = StateHold(st);
     if (st == State::Run) {
         _fleeForce = true;
         _fleeClock = 0.0;
         _runTravel = 0.0;
     }
+    if (st == State::Chase) _chaseLost = 0.0;
+    if (st == State::Walk || st == State::Run) _chaseTarget.clear();
+    // 出手之后隔这么久才许再打一下。放在这儿而不是放在转移表里：表管的是
+    // "什么时候换态"，这条管的是"什么时候再发那个事件"，两件事
+    if (st == State::Attack) {
+        _attackCool = Cfg().attackCoolSec.valueOr(ATTACK_COOL_SEC);
+    }
+    // 物理自己换态的时候不许把表里点的动作集留着 —— 那是表那一侧的事
+    _artSet = false;
     _animClock = 0.0;
     _frameIndex = -1;
     LoadFrames();
+}
+
+// 每一态最多待多久。0 以外都靠它发 TimerExpired
+double Runner::StateHold(State st) const {
+    const CharacterConfig& c = Cfg();
+    switch (st) {
+    case State::BeAttacked: return BEATTACKED_SEC;
+    case State::Stun:       return STUN_SEC;
+    case State::Attack:     return ATTACK_SEC;
+    case State::Victory:    return VICTORY_SEC;
+    // 歇多久是配置里写的，不是这里定的
+    case State::Rest:       return c.restDurationSec.valueOr(REST_DURATION_SEC);
+    // 倒下不自己起来，除非哪天配了复活
+    case State::Dead:       return 1e300;
+    // 走/跑/追没有"放完"这一说，只有最小停留时间
+    default:                return STATE_MIN_SEC;
+    }
+}
+
+int Runner::DirToward(double dx, double dy) const {
+    int best = 0;
+    double bestDot = -1e300;
+    const double n = std::sqrt(dx * dx + dy * dy);
+    if (n <= 1e-9) return _dir;
+    for (int d = 0; d < DIR_COUNT; ++d) {
+        const double dot = (DirDX()[d] * dx + DirDY()[d] * dy) / n;
+        if (dot > bestDot) { bestDot = dot; best = d; }
+    }
+    return best;
+}
+
+// 查表、看抢占等级、真换态。
+//
+// 抢占这条不许省：BeAttacked 打断 Chase 吗？Dead 打断一切吗？不问清楚一定会
+// 写成"谁先算谁赢"。等级高的直接进，等级不够就得等这一态放完
+bool Runner::ApplyStateRule(GameEvent ev, int byId) {
+    if (_stateLocked) return false;
+    if (_stateCool > 0) return false;
+    const CharacterConfig& c = Cfg();
+    const StateRule* r = MatchState(c, _state, ev);
+    if (!r) return false;
+
+    const State to = r->back ? (_returnTo == _state ? State::Walk : _returnTo) : r->to;
+    // 这两条早退都交回 false："态没换成，但事还是发生了"，表情那一半还得让
+    // 事件映射表去管 —— 等级不够拦住的只是换态，不是这件事本身
+    if (to == _state) return false;
+    if (InterruptRank(to) <= InterruptRank(_state) && _stateClock < StateHold(_state))
+        return false;
+
+    if (r->art.set) { _artOverride = r->art.v; _artSet = true; }
+    else _artSet = false;
+
+    if (r->cooldownSec.set) _stateCool = r->cooldownSec.v;
+    else _stateCool = STATE_MIN_SEC;
+
+    // 追人得先知道追谁：UpdateChase 只认这个名字，认不出来就按"跟丢了"算
+    if (to == State::Chase && byId > 0) {
+        if (s_peers) {
+            for (const Runner* o : *s_peers) {
+                if (o && o->Id() == byId) { _chaseTarget = o->Name(); break; }
+            }
+        }
+    }
+
+    // 表里点了名的表情优先于那张事件映射表
+    if (r->emote.set) {
+        if (!r->emote.v.empty()) {
+            std::uniform_int_distribution<int> pick(0, (int)r->emote.v.size() - 1);
+            ShowEmote(r->emote.v[pick(_rng)], c.emoteShowSec.valueOr(EMOTE_SHOW_SEC));
+        }
+        EnterState(to, !r->back);
+        return true;   // 这里该不该安静，表说了算，别拿默认映射去补
+    }
+    // back=true 的那一行本来就是在"回到进态之前"，再写一次 _returnTo 只会把
+    // 它换成刚放完那一态，下次回来就回错地方
+    EnterState(to, !r->back);
+    return false;
+}
+
+// 计时：最小停留、一次性动画放完、还有一态待太久自己散伙
+void Runner::TickState(double dt) {
+    if (_stateCool > 0) _stateCool -= dt;
+    if (_attackCool > 0) _attackCool -= dt;
+    _stateClock += dt;
+    if (_stateLocked) return;
+    if (_stateClock < _stateLimit) return;
+    // 歇着的是等 RestEnd，不是等计时器 —— 到点就起来是它自己的规矩
+    if (_state == State::Rest) { Emit(GameEvent::RestEnd); return; }
+    if (OneShot(_state) || _state == State::Chase) Emit(GameEvent::TimerExpired);
+}
+
+// 追人：朝目标挪，进攻击距离就发 InRange，跟久了发 Lost
+void Runner::UpdateChase(double dt) {
+    if (_state != State::Chase) return;
+    if (_stateLocked) return;
+
+    const Runner* target = nullptr;
+    if (s_peers) {
+        for (const Runner* o : *s_peers) {
+            if (!o || o == this) continue;
+            if (o->Name() == _chaseTarget) { target = o; break; }
+        }
+    }
+    if (!target) {
+        // 目标不在了。这里不许立刻散伙：追丢了先站两秒看看，是原版的规矩
+        _chaseLost += dt;
+        if (_chaseLost >= CHASE_LOST_SEC) Emit(GameEvent::Lost);
+        return;
+    }
+    _chaseLost = 0.0;
+    const Vec2 me = BodyCenter();
+    const Vec2 p = target->BodyCenter();
+    const double bl = BodyLen();
+    const double len = std::sqrt((p.x - me.x) * (p.x - me.x) +
+                                 (p.y - me.y) * (p.y - me.y)) / (bl > 0 ? bl : 1.0);
+    // 进攻击距离不等于马上出手：attackCoolSec 没到就继续跟着，别每 0.6 秒
+    // 换一次态空转
+    if (len <= Cfg().attackLen.valueOr(ATTACK_LEN) && _attackCool <= 0) {
+        Emit(GameEvent::InRange);
+        return;
+    }
+    // 朝向得带迟滞，也不许每拍都重挑。两个人绕着圈走的时候这个数会连着翻，
+    // 翻一次就是换一张条带 —— 八个人同场时缓存被冲穿，physics 从 200ms 涨到
+    // 1500ms。隔 0.35 秒才看一次方向，加上"只比现在好出一点就不许换"，
+    // 换向次数掉到原来的几十分之一
+    if (_chaseSteer > 0.0) { _chaseSteer -= dt; return; }
+    _chaseSteer = 0.35;
+    int want = DirToward(p.x - me.x, p.y - me.y);
+    if (want != _dir) {
+        const double n = std::hypot(p.x - me.x, p.y - me.y);
+        if (n > 1e-9) {
+            const double cur = (DirDX()[_dir] * (p.x - me.x) +
+                                DirDY()[_dir] * (p.y - me.y)) / n;
+            const double best = (DirDX()[want] * (p.x - me.x) +
+                                 DirDY()[want] * (p.y - me.y)) / n;
+            // 只比现在这条好出 0.12 以上才真换。差得少就别动，让它继续走
+            if (best - cur < 0.12) want = _dir;
+        }
+    }
+    SetDirection(want);
 }
 
 // 装备武器只换动作集和腿速，不动状态机：走/跑那套迟滞照旧在跑。
@@ -151,6 +381,8 @@ void Runner::SetArmed(bool flag) {
     _frameIndex = -1;
     LoadFrames();
     _needUpload = true;
+    // 装备这件事得让它自己说一声：SetArmed 只管改状态，后面那几路都是从这条事件来的
+    Emit(GameEvent::Armed);
 }
 
 void Runner::SetDirection(int dir) {
@@ -195,18 +427,217 @@ void Runner::UpdateEscape(double dt) {
     SetDirection(go);
 }
 
+// 遭遇：这一拍该不该理谁、在第几档理。
+//
+// 躲和追都是"理"，所以挑对象和定档位只在这儿做一次，别在 HitPeer 那种地方
+// 再判一遍距离 —— 两处判法早晚会对不上。
+//
+// 这一刀只把"谁 + 多远"这条线立起来并让它能报出来：真去追、真出手是状态机
+// 那一刀的事，现在接进来等于改了今天的脾气
+void Runner::UpdateEncounter(double dt) {
+    if (_encCool > 0) _encCool -= dt;
+    if (!s_peers) return;
+
+    const CharacterConfig& c = Cfg();
+    const Vec2 me = BodyCenter();
+    const double bl = BodyLen();
+    if (bl <= 0.0) return;
+
+    const Runner* hit = nullptr;
+    EncounterBand band = EncounterBand::None;
+    double bestLen = 1e300;
+
+    for (const Runner* o : *s_peers) {
+        if (!o || o == this) continue;
+        // 敌人之间不许互相追打：那是"理"的一支，得在这儿挡掉，
+        // 别挪到挨打那一路里去判 —— 那边只管"这一下怎么挨"
+        if (IsHostile(Id()) && IsHostile(o->Id())) continue;
+        const Vec2 p = o->BodyCenter();
+        const double len = std::sqrt((p.x - me.x) * (p.x - me.x) +
+                                     (p.y - me.y) * (p.y - me.y)) / bl;
+        const EncounterBand real = BandFor(c, len);
+        // 距离这道门不许被开关顶掉：--enc= 只是"这个人确实在范围内，但他落在
+        // 哪一档我替他指定"，不是"多远都算近身"。真站到了范围外就是没遇到
+        if (real == EncounterBand::None) continue;
+        const EncounterBand b = (_opt.forceBand != 0) ? (EncounterBand)_opt.forceBand : real;
+        // 判据在**我**这张表上：我要不要理他，是我的事。对面那份配置只回答
+        // "他打到我我该怎么挨"，那是另一张表
+        const Encounter* mine = MatchEncounter(c, o->Name(), o->Id());
+        const EncounterKind k = mine->KindAt(b);
+        if (k == EncounterKind::Ignore || k == EncounterKind::Separate) continue;
+        if (len < bestLen) {
+            bestLen = len;
+            hit = o;
+            band = b;
+        }
+    }
+
+    if (!hit) {
+        _encLast.clear();
+        _encLastBand = 0;
+        return;
+    }
+
+    // "换人或换档才算一次"：照面一次报一次脸太吵，可两个人换了个位置又得报
+    const int b = (int)band;
+    if (hit->Name() == _encLast && b == _encLastBand) return;
+    _encLast = hit->Name();
+    _encLastBand = b;
+    if (_encCool > 0) return;
+    _encCool = 0.6;
+    ++_stats.encounters;
+
+    Emit(band == EncounterBand::Near ? GameEvent::EncounterNear : GameEvent::EncounterFar,
+         hit->Id());
+}
+
 void Runner::UpdateWander(double dt) {
     _wanderClock += dt;
-    if (_wanderClock < WANDER_SEC) return;
+    if (_wanderClock < Cfg().wanderSec.valueOr(WANDER_SEC)) return;
     _wanderClock = 0.0;
     _dirReason = "wander";
     SetDirection(RandDir(_rng));
+}
+
+// ---- 任务栏漫步 ----
+//
+// 这根线归 main 定：它才知道屏幕多大、任务栏在哪儿。Runner 只管沿着它走，
+// 所以这里一个字都不碰 _ox/_worldW 那套可行走区 —— 那是给满屏乱逛用的，
+// 拿它来夹这根线会把人夹到任务栏底下去
+void Runner::SetTaskbar(bool on, double footY, double loX, double hiX) {
+    if (_opt.taskbar == on && _tbFootY == footY && _tbLoX == loX && _tbHiX == hiX) return;
+    _opt.taskbar = on;
+    _tbFootY = footY;
+    _tbLoX = loX;
+    _tbHiX = hiX;
+    // 关掉这一档得把之前钉的东西全数还回去：状态锁还锁着的话，这人会一辈子
+    // 站在原地不动 —— 那是这一档自己设的，不是状态机设的
+    if (!on) {
+        _stateLocked = false;
+        _state = State::Walk;
+        _returnTo = State::Walk;
+        _artSet = false;
+        _tbPhase = 0;
+        _animClock = 0.0;
+        _frameIndex = -1;
+        LoadFrames();
+        return;
+    }
+    // 起场先走一段，别一上来就杵在那儿不动
+    _tbPhase = 0;
+    _tbFacing = 1;
+    _tbTimer = 4.0;
+    _tbEmote = 3.0;
+    _pos.y = footY;
+    _state = State::Walk;
+    _stateLocked = true;   // 这一档不许转移表插嘴
+    _dirReason = "taskbar";
+    SetDirection(_tbFacing > 0 ? 4 : 0);
+    _animClock = 0.0;
+    _frameIndex = -1;
+    LoadFrames();
+}
+
+// 这一套动作在这张皮肤里到底有没有图。摆姿势之前先看它 —— 不然会去开一个
+// 不存在的文件，然后整个人黑一块
+bool Runner::HasArt(Art a) const {
+    std::error_code ec;
+    const std::wstring p = _opt.skinDir + L"\\" + FolderOf(a) + L"\\dir0.png";
+    return std::filesystem::exists(p, ec);
+}
+
+void Runner::BeginTaskbarPose() {
+    // 胜利优先，没有就退到出拳。两套都没有就别摆，站着就好
+    Art pick = Art::Victory;
+    if (!HasArt(Art::Victory)) pick = Art::Attack;
+    if (!HasArt(pick)) {
+        _tbPhase = 0;
+        _tbTimer = 5.0;
+        return;
+    }
+    _tbPoseArt = pick;
+    _tbPhase = 2;
+    _tbTimer = TB_POSE_SEC;
+    _animClock = 0.0;
+    _frameIndex = -1;
+    LoadFrames();
+}
+
+void Runner::UpdateTaskbar(double dt) {
+    if (_tbHiX <= _tbLoX) _tbHiX = _tbLoX + 1.0;
+    _pos.y = _tbFootY;
+
+    if (_tbEmote > 0) _tbEmote -= dt;
+    // 冒脸：空档到了才冒，而且不许上一枚还挂着就再盖一张
+    if (_tbEmote <= 0 && !_bubble.Busy()) {
+        std::uniform_int_distribution<int> which(3, 4);   // 高兴 / 喜欢
+        ShowEmote(which(_rng), 2.6);
+        std::uniform_real_distribution<double> gap(TB_EMOTE_MIN_SEC, TB_EMOTE_MAX_SEC);
+        _tbEmote = gap(_rng);
+    }
+
+    std::uniform_real_distribution<double> pause(TB_PAUSE_MIN_SEC, TB_PAUSE_MAX_SEC);
+    std::uniform_real_distribution<double> walkDur(4.0, 11.0);
+    std::uniform_real_distribution<double> chance(0.0, 1.0);
+
+    switch (_tbPhase) {
+    case 0: {
+        _tbTimer -= dt;
+        const double sp = TB_WALK_PX * _k * 0.5;
+        _pos.x += _tbFacing * sp * dt;
+        // 到端点就翻面。这是这一档里唯一会改朝向的地方
+        if (_tbFacing > 0 && _pos.x >= _tbHiX) {
+            _pos.x = _tbHiX;
+            _tbFacing = -1;
+            _dirReason = "taskbar";
+            SetDirection(0);
+            _tbPhase = 1;
+            _tbTimer = (double)TB_TURN_PAUSE_SEC;
+        } else if (_tbFacing < 0 && _pos.x <= _tbLoX) {
+            _pos.x = _tbLoX;
+            _tbFacing = 1;
+            _dirReason = "taskbar";
+            SetDirection(4);
+            _tbPhase = 1;
+            _tbTimer = (double)TB_TURN_PAUSE_SEC;
+        } else if (_tbTimer <= 0) {
+            _tbPhase = 1;
+            _tbTimer = pause(_rng);
+        }
+        break;
+    }
+    case 1: {
+        _tbTimer -= dt;
+        if (_tbTimer > 0) break;
+        // 停下来之后顺手摆个姿势，不是每次都摆 —— 全摆反而像在跳舞
+        if (chance(_rng) < TB_POSE_CHANCE) {
+            BeginTaskbarPose();
+        } else {
+            _tbPhase = 0;
+            _tbTimer = walkDur(_rng);
+        }
+        break;
+    }
+    default: {
+        _tbTimer -= dt;
+        if (_tbTimer > 0) break;
+        _tbPhase = 0;
+        _tbTimer = walkDur(_rng);
+        _animClock = 0.0;
+        _frameIndex = -1;
+        LoadFrames();
+        break;
+    }
+    }
 }
 
 // 朝当前方向推一步，越界就夹回来，并把撞到的边记下来
 void Runner::Move(double dt) {
     if (_worldW <= 0 || _worldH <= 0) return;
     if (_hold) return;
+    // 站着不动的态就不许挪窝。这条放在这里而不是散到各处判速度：
+    // "动不动"和"多快"是两件事，两处各判一遍早晚会对不上
+    if (!Moving()) return;
 
     const double speed = CurrentSpeedPx();
     if (_state == State::Run) _runTravel += speed * dt;
@@ -237,6 +668,10 @@ void Runner::Move(double dt) {
     }
     if (breached == 0) return;
     ++_stats.bounces;
+    // 是不是"新的一次撞墙"得在这儿定：底下只按冷却放行，而冷却只有 0.15 秒 ——
+    // 人贴着墙不动时会每 0.15 秒再报一次 BumpWalk，每次把泡泡的 _life 重置成
+    // 2.4 秒，于是那一枚表情永远收不掉。撞墙是事件，不是"还在压着这条边"的状态
+    const bool newBounce = (_lockEdge == 0);
     // 只要这一拍还在压这条边就重新记进锁，不然它反复撞同一面墙不回头
     _lockEdge |= breached;
     if (_bounceCool > 0) return;
@@ -246,8 +681,10 @@ void Runner::Move(double dt) {
         SetDirection(BestFleeDir(_mouse));
         _fleeForce = true;
         _fleeClock = 0.0;
+        if (newBounce) Emit(GameEvent::BumpRun);
     } else {
         SetDirection(PickBounce(breached));
+        if (newBounce) Emit(GameEvent::BumpWalk);
     }
     _bounceCool = BOUNCE_COOLDOWN_SEC;
     _dirLock = BOUNCE_COMMIT_SEC;
@@ -269,13 +706,33 @@ void Runner::UpdateFrame(double dt) {
     }
     _animClock += dt;
     // 帧率按动作集取，不是按走/跑：武器跑比无武器跑慢一档，照搬那两个数
-    // 会让剑影糊成一团
-    double rate = WALK_FPS;
+    // 会让剑影糊成一团。配置里写的 walkFrame/runFrame 只顶走和跑这两档 ——
+    // 武器那两套的节拍是另一张表，没在 xml 里开过口子，别拿它去盖
+    const CharacterConfig& c = Cfg();
+    const double walkFps = c.walkFrameRate.valueOr(WALK_FPS);
+    const double runFps = c.runFrameRate.valueOr(RUN_FPS);
+    // 任务栏漫步：站住那一档腿不许转，只留第一帧 —— 不然就是踩在原地不动的
+    // 跑步机上。摆姿势那一档反过来，必须让它把动作放完
+    if (_opt.taskbar) {
+        if (_tbPhase == 1) {
+            if (_frameIndex != 0) { _frameIndex = 0; _needUpload = true; }
+            return;
+        }
+        _animClock += dt;
+        const double poseFps = (ArtOf() == Art::Attack) ? TB_ATTACK_FPS : TB_VICTORY_FPS;
+        const int idx = (int)std::fmod(std::floor(_animClock * poseFps), (double)_frameCount);
+        if (idx != _frameIndex) {
+            _frameIndex = idx;
+            _needUpload = true;
+        }
+        return;
+    }
+    double rate = walkFps;
     switch (ArtOf()) {
-        case Art::Run:     rate = RUN_FPS;     break;
+        case Art::Run:     rate = runFps;      break;
         case Art::Standby: rate = STANDBY_FPS; break;
         case Art::Run2:    rate = RUN2_FPS;    break;
-        case Art::Walk:    rate = WALK_FPS;    break;
+        case Art::Walk:    rate = walkFps;     break;
     }
     const int idx = (int)std::fmod(std::floor(_animClock * rate), (double)_frameCount);
     if (idx != _frameIndex) {
@@ -325,12 +782,176 @@ double Runner::BodyDistance(Vec2 mouse) const {
     return std::sqrt(dx * dx + dy * dy);
 }
 
+// 身体框。鼠标命中和同伴推开共用这一份 —— 原版 TouchRect 和 BodyHit 就是同一个
+// 矩形，两边各画一套早晚会对不上
+RectD Runner::PeerBox() const {
+    const double hw = HalfW() + TOUCH_PAD_X * _dpi;
+    const double top = _pos.y - BodyLen() - TOUCH_PAD_TOP * _dpi;
+    const double h = BodyLen() + (TOUCH_PAD_TOP + TOUCH_PAD_BOTTOM) * _dpi;
+    return RectD{_pos.x - hw, top, hw * 2.0, h};
+}
+
 bool Runner::BodyHit(Vec2 mouse) const {
     if (IsNaN(mouse)) return false;
-    const double hw = HalfW();
-    const double top = _pos.y - BodyLen() - 4.0 * _dpi;
-    const double bot = _pos.y + 4.0 * _dpi;
-    return std::fabs(mouse.x - _pos.x) <= hw && mouse.y >= top && mouse.y <= bot;
+    return PeerBox().Contains(mouse.x, mouse.y);
+}
+
+// 沿 d 探一个身长，会不会走进哪个同伴的身体框里。这里用的就是 PeerBox()，
+// 故意不再画第二套碰撞框
+bool Runner::PeerAhead(int dir) const {
+    if (!s_peers || !s_separate) return false;
+    if (dir < 0 || dir >= DIR_COUNT) return false;
+    const std::vector<Runner*>& list = *s_peers;
+    if (list.size() < 2) return false;
+    const double reach = PEER_LOOK_LEN * BodyLen();
+    const double px = _pos.x + DirDX()[dir] * reach;
+    const double py = _pos.y + DirDY()[dir] * reach;
+    for (Runner* o : list) {
+        if (!o || o == this) continue;
+        if (o->PeerBox().Inflated(PEER_PAD * _dpi).Contains(px, py)) return true;
+    }
+    return false;
+}
+
+// 桌上有没有别人，离我多近（按身长算）。一个人时给 -1
+double Runner::NearestPeerLen() const {
+    if (!s_peers) return -1.0;
+    const std::vector<Runner*>& list = *s_peers;
+    const Vec2 me = BodyCenter();
+    double best = -1.0;
+    for (Runner* o : list) {
+        if (!o || o == this) continue;
+        const Vec2 c = o->BodyCenter();
+        const double d = std::sqrt((c.x - me.x) * (c.x - me.x) + (c.y - me.y) * (c.y - me.y));
+        if (best < 0.0 || d < best) best = d;
+    }
+    if (best < 0.0 || BodyLen() <= 0.0) return best;
+    return best / BodyLen();
+}
+
+// 被人推开的那一下：只挪位置，然后按新的落点重新夹一次。夹完贴图会跟着新的
+// 地方走，免得这一拍画的是推之前的旧位置
+void Runner::Shove(double dx, double dy) {
+    _pos.x += dx;
+    _pos.y += dy;
+    ClampPos();
+    // 不用在这儿提醒 Present：它每拍都拿 _pos 现算窗口原点，再和 _lastX/_lastY
+    // 比，位置一变自己就会搬。这里硬设 _needUpload 只会白白多拷一张表面
+}
+
+// 把脚底夹回可行走区。和 Move 用的是同一组边界，别在这儿另立一套
+void Runner::ClampPos() {
+    if (_worldW <= 0 || _worldH <= 0) return;
+    const double loX = _ox + PadLeft(), hiX = _ox + _worldW - PadRight();
+    const double loY = _oy + PadTop(), hiY = _oy + _worldH - PadBottom();
+    _pos.x = ClampAxis(_pos.x, loX, hiX, CenterX());
+    _pos.y = ClampAxis(_pos.y, loY, hiY, CenterY());
+}
+
+// 两两看一眼。这条推挤**不算撞墙**：不走 Move、不碰 IntoWall 的边界、也不留
+// lockEdge —— 它只把位置修回来。真上锁的话后面十几拍的放锁条件会一直被一处
+// 不该有的账牵着
+void Runner::SeparateAll() {
+    if (!s_peers || !s_separate) return;
+    const std::vector<Runner*>& list = *s_peers;
+    for (size_t i = 0; i + 1 < list.size(); ++i) {
+        if (!list[i]) continue;
+        for (size_t j = i + 1; j < list.size(); ++j) {
+            if (!list[j]) continue;
+            list[i]->SeparateFrom(list[j]);
+        }
+    }
+}
+
+// a 和 b 之间那一下，动作只从 a 这边发起一次，免得同一对事在两边各推一遍
+void Runner::SeparateFrom(Runner* other) {
+    if (!other) return;
+    const Vec2 ca = BodyCenter();
+    const Vec2 cb = other->BodyCenter();
+    const double dx = cb.x - ca.x;
+    const double dy = cb.y - ca.y;
+    const double gap = HalfW() + other->HalfW() + PEER_PAD * _dpi;
+    const double d = std::sqrt(dx * dx + dy * dy);
+    if (d >= gap) return;
+
+    double ux, uy;
+    if (d < 0.5) {
+        // 两人正好叠死，这条中心线推不出方向来：按下标定一个往左一个往右，
+        // 不然下一拍还是老样子，看着就像钉在了同一个点上
+        if (dx > 0.0) ux = 1.0;
+        else if (dx < 0.0) ux = -1.0;
+        else ux = (dy > 0.0) ? -1.0 : 1.0;
+        uy = 0.0;
+    } else {
+        ux = dx / d;
+        uy = dy / d;
+    }
+
+    const double push = (gap - d) * 0.5 + 1.0;
+    Shove(-ux * push, -uy * push);
+    other->Shove(ux * push, uy * push);
+    NotifyPeerBump(other);
+}
+
+// "他打到我"那一路。
+//
+// 这张表只回答"我长成什么样"，和遭遇表那张"我要不要理他"是两张表 ——
+// 混在一起，"追上去打"和"被打之后怎么挨"就会互相改写。
+//
+// 它不改血也不改伤害（这套程序本来就没有伤害），只管三件事：走哪段动画、
+// 往后退几个身长、换哪张脸。撞上墙那一推**不看这张表**，还是 wall knock
+// 那个数 —— 不然一定有人往 <react> 里加一行想调撞墙
+void Runner::Hit(Runner* attacker) {
+    if (_hitCool > 0) return;
+    _hitCool = HIT_COOL_SEC;
+    ++_stats.hits;
+
+    const CharacterConfig& c = Cfg();
+    const std::wstring who = attacker ? attacker->Name() : std::wstring();
+    const int whoId = attacker ? attacker->Id() : 0;
+    const Reaction* r = MatchReaction(c, who, whoId);
+    const ReactKind kind = r ? r->kind : ReactKind::Normal;
+
+    // 退多远：表里写了就按表的。-1 才是"不置一声"，别拿 0 当这个意思 ——
+    // 0 的意思真的是"一步都不退"
+    const double kb = (r && r->kbLen >= 0.0) ? r->kbLen : HIT_KB_LEN;
+    const double bl = BodyLen();
+
+    // 方向是"离开打我的那个人"。查不到是谁就朝自己现在朝向的反面退
+    double ux = 0.0, uy = 0.0;
+    if (attacker) {
+        const Vec2 me = BodyCenter();
+        const Vec2 p = attacker->BodyCenter();
+        ux = me.x - p.x;
+        uy = me.y - p.y;
+        const double n = std::hypot(ux, uy);
+        if (n > 1e-9) { ux /= n; uy /= n; } else { ux = 1.0; uy = 0.0; }
+    } else {
+        ux = -DirDX()[_dir];
+        uy = -DirDY()[_dir];
+    }
+    Shove(ux * kb * bl, uy * kb * bl);
+
+    // none = 挺住，什么都不演。剩下三种都往事件那一层走：表情和换态
+    // 都由表去管，这里再自己 ShowEmote 一遍就成了两处说法
+    if (kind == ReactKind::None) return;
+    if (kind == ReactKind::Stun) { Emit(GameEvent::StunBegin, whoId); return; }
+    Emit(GameEvent::AttackedBy, whoId);
+}
+
+// 挤开之后报一次脸。两边各自有冷却，谁冷却完了谁说，都还冷却着就闭嘴
+void Runner::NotifyPeerBump(Runner* other) {
+    const bool mine = _peerCool <= 0.0;
+    bool theirs = false;
+    if (other) {
+        theirs = other->_peerCool <= 0.0;
+        if (theirs) other->_peerCool = PEER_BUMP_COOL_SEC;
+    }
+    if (mine) _peerCool = PEER_BUMP_COOL_SEC;
+    if (!mine && !theirs) return;
+    // 和撞墙那一下分得开：撞墙是懵，这个是被人挤到了，所以两张脸各一半
+    if (mine) Emit(GameEvent::PeerBump);
+    if (other && theirs) other->Emit(GameEvent::PeerBump);
 }
 
 int Runner::DirFromVector(double vx, double vy) const {
@@ -556,12 +1177,28 @@ int Runner::BestFleeVec(double vx, double vy) {
     if (len < 0.01) return _dir;
     vx /= len;
     vy /= len;
-    if (std::strcmp(_dirReason, "corner") != 0) _dirReason = "flee";
-    return ScoreFlee(vx, vy);
+    if (std::strcmp(_dirReason, "corner") != 0 && std::strcmp(_dirReason, "encounter") != 0) {
+        _dirReason = "flee";
+    }
+    // 打两遍：一遍当桌上没有别人，一遍把同伴算进去。挑出来的不一样就说明这一拍
+    // 真是在绕人 —— 那个差值才是"躲开"的证据，光看分数看不出来
+    const int goNoPeer = ScoreFlee(vx, vy, false);
+    const int goPeer = ScoreFlee(vx, vy, true);
+    if (goPeer != goNoPeer) {
+        ++_stats.peerBlocks;
+        if (_peerLogCool <= 0.0) {
+            _peerLogCool = PEER_BUMP_COOL_SEC;
+            wchar_t msg[160];
+            swprintf(msg, 160, L"peer 躲开 %d->%d 靠得近=%.2f\n",
+                     goNoPeer, goPeer, NearestPeerLen());
+            OutputDebugStringW(msg);
+        }
+    }
+    return goPeer;
 }
 
-// 八条线各打一遍分。撞墙 1000 > 刚撞过的边 800 > 不脱离 100
-int Runner::ScoreFlee(double vx, double vy) {
+// 八条线各打一遍分。撞墙 1000 > 同伴 500 > 刚撞过的边 800 > 不脱离 100
+int Runner::ScoreFlee(double vx, double vy, bool withPeer) {
     const int ideal = DirFromVector(vx, vy);
     int best = ideal;
     double bestScore = -1e300;
@@ -569,6 +1206,9 @@ int Runner::ScoreFlee(double vx, double vy) {
         double score = DirDX()[d] * vx + DirDY()[d] * vy;
         if (score <= 0.0) score -= 100.0;
         if (IntoWall(d)) score -= 1000.0;
+        // 同伴这条比撞墙轻、比不脱离重：堵在角上时还能靠它绕开，
+        // 又不至于为了躲人就僵住不动
+        if (withPeer && PeerAhead(d)) score -= PEER_PENALTY;
         if (_lockEdge != 0 && TowardEdge(d, _lockEdge)) score -= 800.0;
         // 平时只给一点点不动的偏向就够；锁住的时候必须加大力度，否则墙角上会擦来擦去
         if (d == _dir) score += (_lockEdge == 0 ? 0.6 : CORNER_HOLD_BONUS);
@@ -924,6 +1564,61 @@ void Runner::Present() {
         _lastY = y;
         ++_stats.moves;
     }
+
+    // 泡泡排在角色之后：它的位置是照这一拍真的脚底算的，先传它等于传个旧坐标
+    _bubble.Present();
+}
+
+// ---- 表情 ----
+
+bool Runner::ShowEmote(int id, double seconds) {
+    if (!_bubble.Create()) return false;
+    if (!_bubble.Show(id, seconds)) return false;
+    _lastEmoteId = id;
+    return true;
+}
+
+void Runner::HideEmote() {
+    _bubble.Hide();
+}
+
+// 事件唯一的入口。三路都从这儿派生，别在物理那边直接 SetState() 又在别处
+// 直接 ShowEmote() —— 那样"撞上之后到底该换态还是只换个脸"就没人说得清了
+void Runner::Emit(GameEvent ev, int byId) {
+    // 表里点了名的那一路自己就把脸放了，别再从事件映射表里补一张
+    if (ApplyStateRule(ev, byId)) return;
+    NotifyEmote(ev, byId);
+}
+
+// 物理自己撞出来的那一路：表情照报，但不许回头查表。
+//
+// 走/跑那套迟滞还带着 _runTravel 这个条件，表里再写一遍同一件事就成了两处
+// 说法 —— 谁先跑起来就没准了
+void Runner::EmitPhysical(GameEvent ev) { NotifyEmote(ev, 0); }
+
+// 表情那一半。xml 写过就从那几张里等概率抽；写了但写了 none 就是这里该安静；
+// 一个字都没写过才回到内置那张映射表
+void Runner::NotifyEmote(GameEvent ev, int byId) {
+    (void)byId;   // by= 那一层要等遭遇表接上才有"谁"可填，现在还不许猜
+    const CharacterConfig& c = Cfg();
+    const std::vector<int>* pool = EmotePoolFor(c, ev);
+    if (!pool) {
+        // default="none" 的那位要靠这一句才知道哪些事件是他自己认领过的：
+        // 剩下的那些就别再拿代码那张映射表来替他做主
+        if (!c.eventDefault.valueOr(true)) return;
+        std::uniform_int_distribution<int> coin(0, 1);
+        const int id = BuiltinEmote(ev, (unsigned)coin(_rng));
+        if (id <= 0) return;
+        ShowEmote(id, c.emoteShowSec.valueOr(EMOTE_SHOW_SEC));
+        return;
+    }
+    if (pool->empty()) return;   // 空表 = "这里就该安静"，不是"没配过"
+    std::uniform_int_distribution<int> pick(0, (int)pool->size() - 1);
+    const int id = (*pool)[pick(_rng)];
+    if (id <= 0) return;
+    // 事件逼出来的脸不许因为"上一张也是它"就不放：撞了两次墙本来就该懵两次。
+    // "别连着两次同一张"那是随机冒脸那一路的事，等 emoteGapSec 那条计时接上再说
+    ShowEmote(id, c.emoteShowSec.valueOr(EMOTE_SHOW_SEC));
 }
 
 }  // namespace fd

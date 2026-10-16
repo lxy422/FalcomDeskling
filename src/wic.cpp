@@ -69,23 +69,14 @@ void ComputeCrop(Strip& s) {
 }
 }  // namespace
 
-bool DecodePngStrip(const wchar_t* path, Strip& out) {
-    out = Strip{};
+namespace {
 
-    IWICImagingFactory* f = Factory();
-    if (!f) return false;
-
-    IWICBitmapDecoder* dec = nullptr;
-    if (FAILED(f->CreateDecoderFromFilename(path, nullptr, GENERIC_READ,
-                                            WICDecodeMetadataCacheOnDemand, &dec))) {
-        return false;
-    }
-
+// 解码的公共一段：拿到一个已经开好的 decoder，把第一帧读成 Strip。
+// 走文件的和解内存的都要过这里 —— cell/frames 那套推法只许有这一处，
+// 表情墙要是自己另算一遍，早晚和角色图对不上
+bool StripFromDecoder(IWICImagingFactory* f, IWICBitmapDecoder* dec, Strip& out) {
     IWICBitmapFrameDecode* frame = nullptr;
-    if (FAILED(dec->GetFrame(0, &frame))) {
-        dec->Release();
-        return false;
-    }
+    if (FAILED(dec->GetFrame(0, &frame))) return false;
 
     bool ok = false;
     IWICFormatConverter* conv = nullptr;
@@ -131,7 +122,53 @@ bool DecodePngStrip(const wchar_t* path, Strip& out) {
     }
 
     frame->Release();
+    return ok;
+}
+
+}  // namespace
+
+bool DecodePngStrip(const wchar_t* path, Strip& out) {
+    out = Strip{};
+
+    IWICImagingFactory* f = Factory();
+    if (!f) return false;
+
+    IWICBitmapDecoder* dec = nullptr;
+    if (FAILED(f->CreateDecoderFromFilename(path, nullptr, GENERIC_READ,
+                                            WICDecodeMetadataCacheOnDemand, &dec))) {
+        return false;
+    }
+    const bool ok = StripFromDecoder(f, dec, out);
     dec->Release();
+    return ok;
+}
+
+bool DecodePngMemory(const void* data, size_t len, Strip& out) {
+    out = Strip{};
+    if (!data || len == 0) return false;
+
+    IWICImagingFactory* f = Factory();
+    if (!f) return false;
+
+    // 内存里的那块 PNG 得先包成 IStream 才进得了 WIC。SHGlobalMemory 的第二个
+    // 参数是 TRUE = "这份内存归流自己管"，但我们给的是静态数组，所以必须
+    // FALSE —— 否则流释放时会去 VirtualFree 一块从来没 VirtualAlloc 过的地址
+    IStream* st = nullptr;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, FALSE, &st))) return false;
+
+    bool ok = false;
+    ULONG written = 0;
+    if (SUCCEEDED(st->Write(data, (ULONG)len, &written)) && written == (ULONG)len) {
+        LARGE_INTEGER zero{};
+        st->Seek(zero, STREAM_SEEK_SET, nullptr);
+        IWICBitmapDecoder* dec = nullptr;
+        if (SUCCEEDED(f->CreateDecoderFromStream(st, nullptr,
+                                                 WICDecodeMetadataCacheOnLoad, &dec))) {
+            ok = StripFromDecoder(f, dec, out);
+            dec->Release();
+        }
+    }
+    st->Release();
     return ok;
 }
 
@@ -178,42 +215,25 @@ const wchar_t* FolderOf(Art a) {
         case Art::Walk:    return L"2.Walk";
         case Art::Standby: return L"4.standby";
         case Art::Run2:    return L"5.run2";
+        case Art::Attack:  return L"6.Attack";
+        case Art::Victory: return L"9.Victory";
     }
     return L"2.Walk";
 }
 
-bool HasWalkSet(const std::wstring& dir) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    return fs::is_regular_file(fs::path(dir) / L"2.Walk" / L"dir0.png", ec);
-}
-
-// 排过序的一遍名单。判据走宽松那一档：有 2.Walk 就认这个人，缺哪个动作
-// 就那个动作不可用 —— 别因为一套图里少一张就把这个人整个跳过
-std::vector<SkinInfo> ScanSkins(const std::wstring& root) {
-    namespace fs = std::filesystem;
-    std::vector<SkinInfo> found;
-    std::error_code ec;
-    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
-        if (!it->is_directory(ec)) continue;
-        const fs::path p = it->path();
-        const std::wstring leaf = p.filename().wstring();
-        // 这几个不是人：老摆法摊在旁边的敌人和资源目录
-        if (leaf == L"Enemy" || leaf == L"Resource" || leaf == L"Chr") continue;
-        if (!HasWalkSet(p.wstring())) continue;
-
-        SkinInfo si;
-        si.name = leaf;
-        si.dir = p.wstring();
-        si.hasStandby = fs::is_regular_file(p / L"5.run2" / L"dir0.png", ec) &&
-                        fs::is_regular_file(p / L"4.standby" / L"dir0.png", ec);
-        found.push_back(si);
+// 反着找。目录名是配置里写的东西，认不出来就老实说认不出来
+bool ArtFromFolder(const std::wstring& folder, Art& out) {
+    for (int a = 0; a < ART_COUNT; ++a) {
+        if (_wcsicmp(folder.c_str(), FolderOf(static_cast<Art>(a))) == 0) {
+            out = static_cast<Art>(a);
+            return true;
+        }
     }
-    std::sort(found.begin(), found.end(),
-              [](const SkinInfo& a, const SkinInfo& b) { return a.name < b.name; });
-    return found;
+    return false;
 }
 
+// HasWalkSet / ScanSkins 搬去 store.cpp 了：那边管"上哪儿找人"，这里只管
+// "一套图长什么样"。两处都留一份迟早会对不上
 // 开机扫一遍全部条带求并集框。一条一条解，解完就扔，峰值内存只有一条的量
 bool ComputeSkinBBox(const std::wstring& skinDir, BBox& out) {
     namespace fs = std::filesystem;

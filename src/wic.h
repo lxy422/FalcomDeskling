@@ -33,30 +33,27 @@ struct Strip {
 // 懒解码 + 小容量 LRU：一套皮肤 72 条全解码是 110~170 兆，绝不能这么干
 bool DecodePngStrip(const wchar_t* path, Strip& out);
 
+// 从内存里的一块 PNG 解码。表情墙是编进 exe 的，没有文件名可给，只能走这条
+// 路。cell/frames 那套推法和解文件的完全一样，别在这里另立一套
+bool DecodePngMemory(const void* data, size_t len, Strip& out);
+
 // ---- 动作集 ----
-// 目录名只在这一张表里出现，别的地方一律从这里取。WpfTest 那边是九套，
-// 这边现在只跑得到走/跑/武器走/武器跑这四套 —— 剩下五套（跪、出拳、挨打、
-// 撞倒、胜利）要等遭遇和状态机其余分支接上才有意义，先不列进来免得
-// ComputeSkinBBox 白扫一堆用不上的图。
-enum class Art { Walk, Run, Standby, Run2 };
+// 目录名只在这一张表里出现，别的地方一律从这里取。
+//
+// 六套：走/跑/武器走/武器跑，加上出拳和胜利 —— 后两套以前不列进来是因为
+// 没有分支会用到它们，白扫一堆图。现在任务栏漫步要停下来摆姿势，用得上，
+// 所以补进这张表（挨打和跪那两套还是没接，等 <react> 真跑起来再说）。
+enum class Art { Walk, Run, Standby, Run2, Attack, Victory };
 
 const wchar_t* FolderOf(Art a);
-inline constexpr int ART_COUNT = 4;
+inline constexpr int ART_COUNT = 6;
 
-// 一套皮肤有哪些动作可用。判据走宽松那一档：有 2.Walk 就认这个人，缺哪个
-// 动作就那个动作不可用，别让一整套图里少一张就把这个人整个跳过
-struct SkinInfo {
-    std::wstring name;
-    std::wstring dir;
-    bool hasStandby = false;   // false = 武器动作不齐，托盘里要标出来
-};
+// 反着找：配置里写的是目录名，代码里要的是枚举。认不出来给 false，
+// 别让它猜一个 —— 转移表里指错一套动作，会比什么都不做更难查
+bool ArtFromFolder(const std::wstring& folder, Art& out);
 
-// 有 2.Walk 就算数，和以前 PickSkin 的判据一致
-bool HasWalkSet(const std::wstring& dir);
-// 排过序的一遍名单：菜单和"随机定主角"都从这儿拿，顺序定下来才不会
-// 每次启动菜单换个样子
-std::vector<SkinInfo> ScanSkins(const std::wstring& root);
-
+// SkinInfo / HasWalkSet / 名单扫描现在都住在 store.h：那边管"上哪儿找人"，
+// 这里只管"一套图长什么样"。两处都留一份迟早会对不上
 // 一套皮肤所有条带合起来的可见范围。格内坐标，和 Strip 的 crop 同一套基准。
 // cellW/cellH 是这套皮肤自己的方格尺寸 —— 中心线、脚底线这些基准都按它换算，
 // 尺寸不同的角色进来才不会被拿 256 的尺子量错

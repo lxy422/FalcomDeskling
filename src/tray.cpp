@@ -1,6 +1,8 @@
 #include "tray.h"
+#include "emote.h"   // EmoteTitle：表情子菜单那些名字只有这里一份
 
 #include <cstring>
+#include <cwchar>
 #include <string>
 #include <vector>
 
@@ -62,23 +64,56 @@ void Tray::Popup() {
         AppendMenuW(menu, chk, IDM_ARMED, L"装备武器模式");
     }
 
+    // 任务栏漫步：一个人、一根线、慢速来回走。它和"满桌乱逛"是两种活法，
+    // 所以做成打勾项而不是又开一层子菜单
+    {
+        UINT chk = MF_STRING;
+        if (isTaskbar && isTaskbar()) chk |= MF_CHECKED;
+        AppendMenuW(menu, chk, IDM_TASKBAR, L"任务栏漫步");
+    }
+
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+    // ---- 表情 ----
+    // 18 枚直接列出来，点谁放谁。逐张验的时候这比改代码重编有用得多
+    HMENU emo = CreatePopupMenu();
+    {
+        for (int i = 1; i <= 18; ++i) {
+            wchar_t label[64];
+            swprintf(label, 64, L"%2d  %s", i, EmoteTitle(i));
+            AppendMenuW(emo, MF_STRING, IDM_EMOTE_BASE + (i - 1), label);
+        }
+    }
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)emo, L"表情");
+
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
     // ---- 添加 ----
-    // 名单会随中途加人和往目录里丢夹而变，所以每次开菜单现编
+    // 名单会随中途加人和往目录里丢夹而变，所以每次开菜单现编。
+    //
+    // 顺序按号数排，不在这里现编：菜单里那个人是几号，和遭遇表里 id= 说的是
+    // 不是同一个，全看这份顺序 —— 两处排法早晚会对不上
     HMENU add = CreatePopupMenu();
     {
         std::vector<std::wstring> names;
         if (namesAddable) names = namesAddable();
+        const bool blocked = canAdd && !canAdd();
         if (names.empty()) {
             AppendMenuW(add, MF_STRING | MF_GRAYED, 0, L"没有可添加的人");
         } else {
             int i = 0;
             for (const std::wstring& n : names) {
                 if (i >= IDM_ID_RANGE) break;   // 命令号就这一段，别越界
-                AppendMenuW(add, MF_STRING, IDM_ADD_BASE + i, n.c_str());
+                // 漫步模式下桌上只能有一个人，所以整段都灰着 —— 让人点了
+                // 才发现加不上，比点了报错好
+                AppendMenuW(add, MF_STRING | (blocked ? MF_GRAYED : 0), IDM_ADD_BASE + i,
+                            n.c_str());
                 ++i;
             }
+            // "添加全部"放在最后，用一条线把自己和逐个人的那一段分开
+            AppendMenuW(add, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(add, MF_STRING | (blocked ? MF_GRAYED : 0), IDM_ADD_ALL,
+                        L"添加全部");
         }
     }
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)add, L"添加");
@@ -115,34 +150,48 @@ void Tray::Popup() {
                                    _hwnd, nullptr);
     DestroyMenu(add);
     DestroyMenu(del);
+    DestroyMenu(emo);
     DestroyMenu(menu);
     if (cmd == 0) return;
 
     switch (cmd) {
     case IDM_TOGGLE:
         if (onToggle) onToggle();
-        break;
+        return;
     case IDM_ARMED:
         if (onArmed) onArmed(!(isArmed && isArmed()));
-        break;
+        return;
+    case IDM_TASKBAR:
+        if (onTaskbar) onTaskbar(!(isTaskbar && isTaskbar()));
+        return;
     case IDM_QUIT:
         if (onQuit) onQuit();
-        break;
+        return;
     default:
-        if (cmd >= IDM_ADD_BASE && cmd < IDM_ADD_BASE + IDM_ID_RANGE) {
-            if (namesAddable && onAdd) {
-                const std::vector<std::wstring> names = namesAddable();
-                const int i = cmd - IDM_ADD_BASE;
-                if (i < (int)names.size()) onAdd(names[i]);
-            }
-        } else if (cmd >= IDM_DEL_BASE && cmd < IDM_DEL_BASE + IDM_ID_RANGE) {
-            if (namesOnscreen && onRemove) {
-                const std::vector<std::wstring> names = namesOnscreen();
-                const int i = cmd - IDM_DEL_BASE;
-                if (i < (int)names.size()) onRemove(names[i]);
-            }
-        }
         break;
+    }
+
+    if (cmd == IDM_ADD_ALL) {
+        if (onAddAll && (!canAdd || canAdd())) onAddAll();
+        return;
+    }
+
+    // 剩下三段都是"基址 + 下标"，下标还得现问一遍名单 —— 名单在菜单开起来
+    // 之后可能已经变了，拿菜单里那个序号去对上一次的表会点错人
+    if (cmd >= IDM_EMOTE_BASE && cmd < IDM_EMOTE_BASE + 18) {
+        if (onEmote) onEmote(cmd - IDM_EMOTE_BASE + 1);
+    } else if (cmd >= IDM_ADD_BASE && cmd < IDM_ADD_BASE + IDM_ID_RANGE) {
+        if (namesAddable && onAdd) {
+            const std::vector<std::wstring> names = namesAddable();
+            const int i = cmd - IDM_ADD_BASE;
+            if (i < (int)names.size()) onAdd(names[i]);
+        }
+    } else if (cmd >= IDM_DEL_BASE && cmd < IDM_DEL_BASE + IDM_ID_RANGE) {
+        if (namesOnscreen && onRemove) {
+            const std::vector<std::wstring> names = namesOnscreen();
+            const int i = cmd - IDM_DEL_BASE;
+            if (i < (int)names.size()) onRemove(names[i]);
+        }
     }
 }
 
