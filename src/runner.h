@@ -30,6 +30,7 @@ public:
         // xml 里没写 id= 时该用哪个号。AddEntity 从 SkinInfo 带进来 ——
         // 名单已经排过序了，这里只是把那个序号交给配置层，别在这儿另算一遍
         int idHint = 0;
+        Faction faction = Faction::Unset;
         // --id=<N>：强行把这个人当 N 号。区间和阵营那两条规则光看默认号数
         // 试不出来 —— 桌上全是 1..14，永远撞不到 101..200 那一行
         int forceId = 0;
@@ -93,6 +94,9 @@ public:
     bool Create(LayeredWindow* win, const Options& opt);
     void Tick(double dt, Vec2 mouse);
     void Present();
+    void SetDisplay(const RECT& work, double dpiScale);
+    double LeftExtent() const { return ExtLeft(); }
+    double RightExtent() const { return ExtRight(); }
 
     State GetState() const { return _state; }
     int Dir() const { return _dir; }
@@ -106,8 +110,20 @@ public:
     bool TaskbarMode() const { return _opt.taskbar; }
     // 全局装备开关会逐个叫到每个 Runner 头上。缺武器图的时候这里自己吞掉，
     // 不报错也不崩 —— 托盘那个勾还是全局的，只是这个人没得可换
-    void SetArmed(bool flag);
+    void SetArmed(bool flag, bool automatic = false);
     bool Armed() const { return _armed; }
+    bool IsEnemy() const { return EnemyFaction(_faction); }
+    int Hp() const { return _hp; }
+    int MaxHp() const { return StartingHp(_faction); }
+    bool Downed() const { return _hp <= 0; }
+    bool Entering() const { return _enterLeft > 0; }
+    bool Targetable() const { return !Downed() && !Entering(); }
+    bool Gone() const { return IsEnemy() && Downed() && _lifeAge >= 3.0; }
+    uint64_t EntityId() const { return _entityId; }
+    uint64_t TargetId() const { return _targetId; }
+    uint64_t Attacks() const { return _attacks; }
+    void EnterFromEdge(int side);
+    const Runner* SelectTarget() const;
 
     // ---- 表情 ----
     // 直接放一枚。返回 False = 这号不存在或者图集没解出来，调用方得听得见这句
@@ -169,17 +185,17 @@ public:
     // 注意这里换的只是"取哪套图"，物理那一侧的 _armed/_state 一个字都不动 ——
     // 拿它去换速度，半宽和腿速就会脱节
     Art ArtOf() const {
-        // 任务栏漫步那一档只认自己那两套：走的时候是走路，摆姿势的时候是
-        // 挑好的那套。这里不许再去看 _armed —— 这一档压根没有武器这回事
-        if (_opt.taskbar) {
-            return _tbPhase == 2 ? _tbPoseArt : Art::Walk;
-        }
-        // 转移表点了名就听它的：表里写 art=7.BeAttacked，画面上就该是那套
-        if (_artSet) return ArtKind(Cfg(), _artOverride);
-        Art a = (_state == State::Run || _state == State::Chase)
-                    ? (_armed ? Art::Run2 : Art::Run)
-                    : (_armed ? Art::Standby : Art::Walk);
-        return ArtKind(Cfg(), a);
+        if (_battleActive) return ResolveArt(_battleArt);
+        if (_opt.taskbar) return ResolveArt(_tbPhase == 2 ? _tbPoseArt : Art::Walk);
+        if (_artSet) return ResolveArt(ArtKind(Cfg(), _artOverride));
+        if (_state == State::Attack) return ResolveArt(Art::Attack);
+        if (_state == State::BeAttacked) return ResolveArt(Art::BeAttacked);
+        if (_state == State::Stun || _state == State::Dead) return ResolveArt(Art::Kneel2);
+        if (_state == State::Rest) return ResolveArt(Art::Down);
+        if (_state == State::Victory) return ResolveArt(Art::Victory);
+        const Art a = (_state == State::Run || _state == State::Chase)
+            ? (_armed ? Art::Run2 : Art::Run) : (_armed ? Art::Standby : Art::Walk);
+        return ResolveArt(ArtKind(Cfg(), a));
     }
     // 身长按皮肤自己的格径缩放：82 是按 256 格定的，换成 512 格就该是 164。
     // 配置里写了 bodylen= 就按她自己的，没写还是那把公共尺子
@@ -206,7 +222,7 @@ public:
     // --id= 走的是这里，不是改缓存里的那份配置：配置是所有人共享的，
     // 拿它当测试开关会把别的人也一起改了
     int Id() const { return _opt.forceId > 0 ? _opt.forceId : Cfg().id; }
-    Faction MyFaction() const { return FactionOf(Id()); }
+    Faction MyFaction() const { return _faction; }
 
     struct Stats {
         uint64_t ticks = 0;
@@ -245,6 +261,25 @@ public:
     }
 
 private:
+    bool TickBattle(double dt);
+    void BattleArt(Art art, bool once = false, bool restart = false);
+    Art ResolveArt(Art art) const;
+    void BattleMove(double dx, double dy);
+    double BattleDistance(const Runner& other) const;
+    void ResetBattle();
+    Faction _faction = Faction::Ally;
+    uint64_t _entityId = 0, _targetId = 0, _lastHitter = 0, _attacks = 0;
+    int _hp = 10;
+    double _lifeAge = 0, _battleCool = 0, _actionLeft = 0, _disarmClock = 0;
+    bool _battleActive = false, _battleOnce = false, _autoArmed = false;
+    Art _battleArt = Art::Standby;
+    bool _available[ART_COUNT][DIR_COUNT]{};
+    double _enterLeft = 0;
+    Vec2 _enterEnd{}, _enterUnit{}, _knockUnit{};
+    double _knockLeft = 0;
+    double _idleAge = 0, _manualWeaponHold = 0;
+    bool _entryClip = false;
+    BYTE _opacity = 255;
     void SetState(State st);
     void SetDirection(int dir);
     // 换态并记下"从哪儿来"。fromRule=false 是物理那边自己换的（走/跑那套迟滞），

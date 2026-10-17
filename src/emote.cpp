@@ -2,6 +2,7 @@
 #include "emotio_data.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 
@@ -11,9 +12,7 @@ namespace {
 constexpr int kCell = 32;
 
 // slot(n)：图集里第 n 格。8 列 8 行，行优先
-struct Slot {
-    int x, y, w, h;
-};
+using Slot = EmoteFrame;
 
 constexpr Slot slot(int n) {
     return Slot{(n % 8) * kCell, (n / 8) * kCell, kCell, kCell};
@@ -105,7 +104,34 @@ int EmotionSheet::FrameCount(int id) const {
 
 const EmoteFrame* EmotionSheet::Frames(int id) const {
     if (id < 1 || id > EMOTE_LAST_ID) return nullptr;
-    return reinterpret_cast<const EmoteFrame*>(kTable[id].frames);
+    return kTable[id].frames;
+}
+
+bool EmotionSheet::DrawFrame(HDC dc, int id, int frame, int x, int y, int w, int h) const {
+    const auto* frames = Frames(id);
+    if (!_loaded || !dc || !frames || frame < 0 || frame >= FrameCount(id) || w <= 0 || h <= 0) return false;
+    const auto& f = frames[frame];
+    if (f.w <= 0 || f.w > kCell || f.h <= 0 || f.h > kCell * 2 ||
+        f.x < 0 || f.y < 0 || f.x + f.w > AtlasW() || f.y + f.h > AtlasH()) return false;
+    // GDI handles a cropped source Y differently when scaling this top-down
+    // atlas. Extract a small complete DIB first: source (0,0) then works at
+    // both 1x and scaled sizes, without depending on a driver-specific flip.
+    std::array<uint32_t, kCell * kCell * 2> pixels;
+    for (int row = 0; row < f.h; ++row) {
+        std::copy_n(Pixels() + (f.y + row) * (Stride() / 4) + f.x,
+                    f.w, pixels.data() + row * f.w);
+    }
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = f.w;
+    bi.bmiHeader.biHeight = -f.h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    SetStretchBltMode(dc, COLORONCOLOR);
+    const int rows = StretchDIBits(dc, x, y, w, h, 0, 0, f.w, f.h,
+                                  pixels.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+    return rows != 0 && rows != GDI_ERROR;
 }
 
 void EmotionSheet::GroupBox(int id, int& w, int& h) const {
@@ -304,18 +330,7 @@ void EmoteBubble::Present() {
         const int dstX = (_boxW - dstW) / 2;
         const int dstY = _boxH - dstH;
 
-        BITMAPINFO bi{};
-        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-        bi.bmiHeader.biWidth = EmotionSheet::Shared().AtlasW();
-        bi.bmiHeader.biHeight = -EmotionSheet::Shared().AtlasH();
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
-
-        HDC dc = _win->MemDC();
-        SetStretchBltMode(dc, COLORONCOLOR);
-        StretchDIBits(dc, dstX, dstY, dstW, dstH, f.x, f.y, f.w, f.h,
-                      EmotionSheet::Shared().Pixels(), &bi, DIB_RGB_COLORS, SRCCOPY);
+        if (!sheet.DrawFrame(_win->MemDC(), _id, idx, dstX, dstY, dstW, dstH)) return;
 
         _win->Present(_x, _y);
         _needUpload = false;

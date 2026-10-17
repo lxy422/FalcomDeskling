@@ -150,11 +150,10 @@ bool DecodePngMemory(const void* data, size_t len, Strip& out) {
     IWICImagingFactory* f = Factory();
     if (!f) return false;
 
-    // 内存里的那块 PNG 得先包成 IStream 才进得了 WIC。SHGlobalMemory 的第二个
-    // 参数是 TRUE = "这份内存归流自己管"，但我们给的是静态数组，所以必须
-    // FALSE —— 否则流释放时会去 VirtualFree 一块从来没 VirtualAlloc 过的地址
+    // Write copies the static PNG into memory allocated by the stream.
+    // Release must also free that allocation (the source array stays untouched).
     IStream* st = nullptr;
-    if (FAILED(CreateStreamOnHGlobal(nullptr, FALSE, &st))) return false;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &st))) return false;
 
     bool ok = false;
     ULONG written = 0;
@@ -179,6 +178,14 @@ StripCache& StripCache::Shared() {
 
 // 按字节淘汰最久没用的那一份。只放掉缓存自己那份引用，外面还攥着的
 // shared_ptr 继续有效，也不会像裸指针那样被 erase 挪到别的槽位上去
+void StripCache::EvictSkin(const std::wstring& dir) {
+    const auto prefix = dir + L"\\";
+    for (auto it = _items.begin(); it != _items.end();) {
+        if (it->path.compare(0, prefix.size(), prefix) == 0) { _bytes -= it->bytes; it = _items.erase(it); }
+        else ++it;
+    }
+}
+
 void StripCache::Trim() {
     while (_bytes > _budget && _items.size() > 1) {
         size_t victim = 0;
@@ -209,6 +216,19 @@ StripPtr StripCache::Get(const std::wstring& path) {
 }
 
 // ---- 动作集 ----
+double AnimationRate(Art art) {
+    switch (art) {
+    case Art::Run: return 20;
+    case Art::Down: return 1;
+    case Art::Standby: return 7;
+    case Art::Run2: return 12;
+    case Art::Attack: return 16;
+    case Art::BeAttacked: return 1;
+    case Art::Kneel2: return 8;
+    case Art::Victory: return 15;
+    default: return 12;
+    }
+}
 const wchar_t* FolderOf(Art a) {
     switch (a) {
         case Art::Run:     return L"1.Run";
@@ -217,6 +237,9 @@ const wchar_t* FolderOf(Art a) {
         case Art::Run2:    return L"5.run2";
         case Art::Attack:  return L"6.Attack";
         case Art::Victory: return L"9.Victory";
+        case Art::Down: return L"3.kneel";
+        case Art::BeAttacked: return L"7.BeAttacked";
+        case Art::Kneel2: return L"8.Kneel2";
     }
     return L"2.Walk";
 }

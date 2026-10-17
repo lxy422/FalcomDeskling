@@ -6,7 +6,7 @@
 #     stay up, the pop loop never ran.
 #  2. y never changes. The whole point is a single horizontal line; drifting
 #     vertically means it is still using the walk-around clamp.
-#  3. x moves, and reverses at both ends. Two turns in 20s proves the edges
+#  3. x moves, and reverses at both ends. Two observed turns prove the edges
 #     are real and not just a random walk.
 #  4. slow. Under a walk-speed threshold, so a regression to normal walking
 #     shows up as a number, not as "hmm it looks fast".
@@ -19,7 +19,7 @@
 # Keep ASCII-only: PS 5.1 decodes .ps1 with the system codepage.
 param(
     [int]$Seconds = 12,
-    [int]$TurnSeconds = 22
+    [int]$TurnSeconds = 60
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,18 +27,48 @@ $root = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $root "build\bin\FalcomDeskling.exe"
 $stats = Join-Path $root "build\bin\falcomdeskling_stats.txt"
 
-function RunTaskbar($extra, $secs) {
-    Stop-Process -Name FalcomDeskling -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 300
+function CountTurns($lines) {
+    $lastX = $null
+    $lastSign = 0
+    $turns = 0
+    foreach ($line in $lines) {
+        if ($line -notmatch 'pos=(-?[\d.]+),(-?[\d.]+)') { continue }
+        $x = [double]$matches[1]
+        if ($null -ne $lastX) {
+            $delta = $x - $lastX
+            if ([math]::Abs($delta) -ge 0.5) {
+                $sign = [math]::Sign($delta)
+                if ($lastSign -ne 0 -and $sign -ne $lastSign) { $turns++ }
+                $lastSign = $sign
+            }
+        }
+        $lastX = $x
+    }
+    return $turns
+}
+
+function RunTaskbar($extra, $secs, $targetTurns = 0) {
+    # Stats are shared, so refuse concurrent instances instead of killing them.
+    if (Get-Process -Name FalcomDeskling -ErrorAction SilentlyContinue) {
+        throw 'Close existing FalcomDeskling instances before running this test.'
+    }
     if (Test-Path $stats) { Remove-Item $stats -Force }
-    $args = @("--skin=all", "--stats", "--tick=33", "--taskbar")
-    if ($extra) { $args += ($extra -split ' ') }
-    $p = Start-Process -FilePath $exe -ArgumentList $args -PassThru `
+    $runArgs = @("--skin=all", "--stats", "--tick=33", "--taskbar")
+    if ($extra) { $runArgs += ($extra -split ' ') }
+    $p = Start-Process -FilePath $exe -ArgumentList $runArgs -PassThru -WindowStyle Hidden `
                        -WorkingDirectory (Join-Path $root "build\bin")
-    for ($i = 0; $i -lt 40 -and -not (Test-Path $stats); $i++) { Start-Sleep -Milliseconds 200 }
-    Start-Sleep -Seconds $secs
-    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 400
+    try {
+        for ($i = 0; $i -lt $secs; $i++) {
+            Start-Sleep -Seconds 1
+            if ($p.HasExited) { throw 'Taskbar process exited unexpectedly.' }
+            if ($targetTurns -gt 0 -and (Test-Path $stats)) {
+                $snapshot = Get-Content $stats -Encoding Unicode
+                if ((CountTurns $snapshot) -ge $targetTurns) { break }
+            }
+        }
+    } finally {
+        if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+    }
     if (-not (Test-Path $stats)) { return $null }
     return (Get-Content $stats -Encoding Unicode)
 }
@@ -77,7 +107,7 @@ $badState = @($states | Where-Object { $_ -ne 0 }).Count
 $poses = @($lines | Select-String 'emote=(?!-)[^\s]+').Count
 Write-Host ("lines showing an emote up: {0}" -f $poses)
 
-# ---- run B: same logic, 8x the speed so an edge is reachable in 22s ----
+# ---- run B: observe two turns, with a bounded timeout ----
 #
 # The line is in physical pixels and does not care about --scale, but the leg
 # speed does (it goes through _k). Blowing the scale up is the only honest way
@@ -85,7 +115,7 @@ Write-Host ("lines showing an emote up: {0}" -f $poses)
 # not prove the edge code works.
 Write-Host ""
 Write-Host "---- run B: --scale=800 so the edges are reachable ----"
-$lines2 = RunTaskbar "--scale=800" $TurnSeconds
+$lines2 = RunTaskbar "--scale=800" $TurnSeconds 2
 if ($null -eq $lines2) { Write-Host "NO STATS (run B)"; exit 1 }
 $head2 = $lines2 | Select-String '^t=' | Select-Object -Last 1
 $samples2 = @()

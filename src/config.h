@@ -156,6 +156,7 @@ constexpr double CHASE_LOST_SEC      = 2.0;   // 追丢了多久才放弃
 // 这一档整个不走鼠标那套：人只在一根水平线上来回蹭，所以速度单独定，
 // 比走路还慢一档才像"在任务栏上散步"而不是"在赶路"
 constexpr double TB_WALK_PX          = 55.0;
+constexpr double TB_WALK_FPS         = 6.0;
 constexpr double TB_PAUSE_MIN_SEC    = 1.5;   // 偶尔停下来，停这么短
 constexpr double TB_PAUSE_MAX_SEC    = 4.0;   // 停这么久
 constexpr double TB_POSE_SEC         = 2.2;   // 姿势摆多久

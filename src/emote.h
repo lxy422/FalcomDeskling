@@ -60,6 +60,7 @@ public:
 
     int FrameCount(int id) const;
     const EmoteFrame* Frames(int id) const;
+    bool DrawFrame(HDC dc, int id, int frame, int x, int y, int w, int h) const;
 
     // 整组最大框。**泡泡窗口的尺寸只从它算**，不能拿当前这一帧的高：
     // 狂怒前两帧 32 高、后两帧 64 高，按帧定位置会让它每 300 毫秒往上蹿一次

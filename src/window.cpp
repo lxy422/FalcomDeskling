@@ -39,6 +39,10 @@ LRESULT LayeredWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         // 那等于把整个程序一起关了。退出只从托盘那条路来
         _hwnd = nullptr;
         return 0;
+    case WM_DPICHANGED:
+        // Runner owns the foot anchor and backing surface. main refreshes its
+        // monitor geometry before presenting; the suggested OS rect is unused.
+        return 0;
     case WM_WINDOWPOSCHANGED: {
         // 被别的窗口挪过就别再拿旧坐标做差分了
         auto wp2 = reinterpret_cast<WINDOWPOS*>(lp);
@@ -156,7 +160,7 @@ bool LayeredWindow::Present(int x, int y) {
     BLENDFUNCTION bf{};
     bf.BlendOp = AC_SRC_OVER;
     bf.BlendFlags = 0;
-    bf.SourceConstantAlpha = 255;
+    bf.SourceConstantAlpha = _opacity;
     bf.AlphaFormat = AC_SRC_ALPHA;
 
     if (!UpdateLayeredWindow(_hwnd, nullptr, &dst, &sz, _memDc, &src, 0, &bf, ULW_ALPHA)) {

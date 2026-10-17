@@ -14,17 +14,11 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// ---- 阵营区间 ----
-//
-// 201..1000 是一个「可分」的空间，不是一个「必须分完」的空间：Enemy\ 底下
-// 两百多只怪默认全部落在 201，差别只在图上。想点名单只，要么在遭遇表里
-// 写 name=，要么在她夹里那份 character.xml 里明写一个 id。
-//
-// 这么定的理由：目录名天生不撞，顺序 id 一增删就全体错位。
+// Legacy numeric XML selectors. Runtime combat uses resource-root factions.
 const FactionBand kBands[] = {
-    {1,   100,  Faction::Ally},
-    {101, 200,  Faction::EnemyChar},
-    {201, 1000, Faction::Monster},
+    {0,   999,  Faction::Ally},
+    {1000, 9999, Faction::Enemy1},
+    {10000, 2147483647, Faction::Enemy2},
 };
 
 constexpr int kMonsterDefaultId = 201;
@@ -116,8 +110,8 @@ bool ParseFaction(const std::wstring& s, Faction& out) {
     std::wstring t = s;
     std::transform(t.begin(), t.end(), t.begin(), ::towlower);
     if (t == L"ally")       { out = Faction::Ally; return true; }
-    if (t == L"enemychar" || t == L"enemy") { out = Faction::EnemyChar; return true; }
-    if (t == L"monster")    { out = Faction::Monster; return true; }
+    if (t == L"enemy1" || t == L"enemychar" || t == L"enemy") { out = Faction::EnemyChar; return true; }
+    if (t == L"enemy2" || t == L"monster")    { out = Faction::Monster; return true; }
     return false;
 }
 
@@ -443,9 +437,9 @@ CharacterConfig SeedAlly() {
 }
 
 // 读 EnemyRoot() 底下那份公共底。没有就交回一份纯默认
-CharacterConfig LoadMonsterBase() {
+CharacterConfig LoadMonsterBase(const std::wstring& dir) {
     CharacterConfig c = SeedMonster();
-    const std::wstring& root = EnemyRoot();
+    const std::wstring root = EnemyRootFor(DirectoryFaction(dir));
     if (root.empty()) return c;
     std::error_code ec;
     const fs::path p = fs::path(root) / L"monster.xml";
@@ -473,7 +467,7 @@ uint64_t g_configGen = 0;
 
 CharacterConfig LoadOne(const std::wstring& dir, int idHint) {
     const bool enemy = IsEnemyDir(dir);
-    CharacterConfig c = enemy ? LoadMonsterBase() : SeedAlly();
+    CharacterConfig c = enemy ? LoadMonsterBase(dir) : SeedAlly();
     // 兜底号：xml 里没写 id= 才用它。敌人那份底色已经带了 201，这里不覆盖。
     //
     // 号数从 0 开始发（托盘菜单按它排），所以这里不能再拿 idHint > 0 当
@@ -496,20 +490,14 @@ CharacterConfig LoadOne(const std::wstring& dir, int idHint) {
         }
     }
 
-    c.faction = FactionOf(c.id);
-    if (c.faction == Faction::Unset) {
-        c.faction = enemy ? Faction::Monster : Faction::Ally;
-        // id=0 是"没写过"的意思，不是越界。这里要是也报一句，桌上每个人都会
-        // 带一条假警告，真越界的那一个反而被淹掉了
-        if (c.id != 0) {
-            c.warnings.push_back(L"id=" + std::to_wstring(c.id) +
-                                 L" 落在任何一段区间之外，按 " +
-                                 (enemy ? L"monster" : L"ally") + L" 处理");
-        }
-    }
-    if (c.emotePool.empty()) {
+    // Runtime allegiance follows the resource root, never an incidental XML id.
+    c.faction = DirectoryFaction(dir);
+    c.hp.Assign(StartingHp(c.faction));
+    if (enemy) c.id = idHint;
+    if (c.emotePool.empty() && !c.emotePoolSet && !enemy) {
         for (int i = 1; i <= EMOTE_LAST_ID; ++i) c.emotePool.push_back(i);
     }
+    if (enemy) { c.emotePool.clear(); c.eventDefault.Assign(false); }
     return c;
 }
 
@@ -529,7 +517,7 @@ bool IsHostile(int id) {
     return f == Faction::EnemyChar || f == Faction::Monster;
 }
 
-bool HasHp(int id) { return IsHostile(id); }
+bool HasHp(int id) { return FactionOf(id) != Faction::Unset; }
 
 const wchar_t* StateName(State s) {
     switch (s) {
@@ -876,8 +864,8 @@ std::wstring DumpConfig(const CharacterConfig& c, const std::wstring& dir) {
     s += buf;
     swprintf(buf, 512, L"  id=%d  阵营=%s  认下来 %d 项%s\n", c.id,
              c.faction == Faction::Ally ? L"ally" :
-             c.faction == Faction::EnemyChar ? L"enemychar" :
-             c.faction == Faction::Monster ? L"monster" : L"unset",
+             c.faction == Faction::EnemyChar ? L"enemy1" :
+             c.faction == Faction::Monster ? L"enemy2" : L"unset",
              c.fields, g_configDisabled ? L"  (--no-config：xml 全不读)" : L"");
     s += buf;
 

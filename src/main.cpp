@@ -1,4 +1,7 @@
 #include "config.h"
+#include "display.h"
+#include "enemy.h"
+#include <set>
 #include "charconf.h"
 #include "runner.h"
 #include "store.h"
@@ -38,6 +41,7 @@ struct Entity {
     std::unique_ptr<Runner> runner;
     std::wstring name;
     bool hasWeaponArt = false;
+    HMONITOR monitor = nullptr;
 };
 
 std::vector<std::unique_ptr<Entity>> g_entities;
@@ -80,6 +84,10 @@ bool g_dumpCell = false;
 // 任务栏漫步：一个人、一根线、慢速来回走。命令行 --taskbar 直接开起来，
 // 之后托盘那个勾也能随时切换
 bool g_taskbar = false;
+EnemySpawner g_enemySpawner;
+DisplayArea g_spawnDisplay;
+bool g_displayDirty = true;
+double g_userScale = DEFAULT_SCALE;
 int g_forceDir = -1, g_forceFrame = -1;
 // 这几个必须是全局：AddEntity 建第二个人的时候要拿它们判"dump 只让第一个
 // 角色写"。只在局部 opt 上设，后面加进来的人就全都没了
@@ -140,9 +148,14 @@ void RebuildPeers() {
 // 也要接上这根线，不然他会照满屏那套乱逛
 void ApplyTaskbarGeometry();
 
+size_t FriendlyCount() {
+    return (size_t)std::count_if(g_entities.begin(), g_entities.end(), [](const auto& e) { return !e->runner->IsEnemy(); });
+}
+
 // 建一个角色：窗口 + Runner。失败就把自己收拾干净再回来，不留半个窗口
 bool AddEntity(const SkinInfo& si) {
-    if ((int)g_entities.size() >= g_maxEntities) return false;
+    if (si.faction == Faction::Ally && ((int)FriendlyCount() >= g_maxEntities || (g_taskbar && FriendlyCount() > 0))) return false;
+    for (const auto& e : g_entities) if (e->runner->Name() == si.name && e->runner->MyFaction() == si.faction) return false;
 
     auto win = std::make_unique<LayeredWindow>();
     // 先按整格开一个尺寸，第一拍 Present 会照它自己那套皮肤的框 Resize 一次。
@@ -156,6 +169,7 @@ bool AddEntity(const SkinInfo& si) {
     auto e = std::make_unique<Entity>();
     e->name = si.name;
     e->hasWeaponArt = si.hasStandby;
+    e->monitor = g_spawnDisplay.handle;
     e->win = std::move(win);
 
     Runner::Options o = g_opt;
@@ -166,6 +180,7 @@ bool AddEntity(const SkinInfo& si) {
     // 号数从名单那边带过来：ScanChr() 已经排过序也发过号了，这里只是传话，
     // 别在配置层再算一遍顺序 —— 两处排序早晚会对不上
     o.idHint = si.id;
+    o.faction = si.faction;
     // 钉方向/帧是给调试截图用的，多角色时只该管第一个，别把所有人都冻住
     o.forceDir = g_entities.empty() ? g_forceDir : -1;
     o.forceFrame = g_entities.empty() ? g_forceFrame : -1;
@@ -186,21 +201,31 @@ bool AddEntity(const SkinInfo& si) {
     if (g_stack && !g_entities.empty()) {
         e->runner->SetPos(g_entities.front()->runner->Pos());
     }
-    e->runner->SetArmed(g_armed);
+    if (!e->runner->IsEnemy()) e->runner->SetArmed(g_armed);
+    e->runner->SetDisplay(g_spawnDisplay.work, g_spawnDisplay.dpi / 96.0);
+    if (e->runner->IsEnemy()) {
+        if (g_taskbar) {
+            const auto line = TaskbarLedge(g_spawnDisplay, e->runner->LeftExtent(), e->runner->RightExtent());
+            e->runner->SetTaskbar(true, line.y, line.left, line.right);
+        }
+        e->runner->EnterFromEdge(g_enemySpawner.Side(g_taskbar));
+    }
     e->runner->Present();
     g_entities.push_back(std::move(e));
     // 新开的人也得知道这根线在哪儿，否则他会照满屏那套乱逛
     if (g_taskbar) ApplyTaskbarGeometry();
+    RebuildPeers();
     return true;
 }
 
 // 删一个角色。顺序要紧：Runner 持有 LayeredWindow*，得先让它撒手
 void RemoveEntity(const std::wstring& name) {
     for (auto it = g_entities.begin(); it != g_entities.end(); ++it) {
-        if ((*it)->name == name) {
+        if ((*it)->name == name && !(*it)->runner->IsEnemy()) {
             (*it)->runner.reset();
             (*it)->win.reset();
             g_entities.erase(it);
+            RebuildPeers();
             return;
         }
     }
@@ -215,7 +240,7 @@ std::vector<std::wstring> NamesAddable() {
     for (const SkinInfo& s : g_skins) {
         bool on = false;
         for (const auto& e : g_entities) {
-            if (e->name == s.name) { on = true; break; }
+            if (e->name == s.name && !e->runner->IsEnemy()) { on = true; break; }
         }
         if (!on) out.push_back(s.name);
     }
@@ -238,53 +263,56 @@ std::vector<std::wstring> NamesAddable() {
 
 std::vector<std::wstring> NamesOnscreen() {
     std::vector<std::wstring> out;
-    for (const auto& e : g_entities) out.push_back(e->name);
+    for (const auto& e : g_entities) if (!e->runner->IsEnemy()) out.push_back(e->name);
     return out;
 }
 
 // 全局开关：逐个叫过去。缺武器图的人自己会在 SetArmed 里吞掉
 void SetAllArmed(bool flag) {
     g_armed = flag;
-    for (auto& e : g_entities) e->runner->SetArmed(flag);
+    for (auto& e : g_entities) if (!e->runner->IsEnemy()) e->runner->SetArmed(flag);
 }
 
 // ---- 任务栏漫步 ----
 //
-// 这根线在哪儿只有 main 知道：它得看得见屏幕有多大、任务栏在哪儿。
-// Runner 那边一律不自己推 —— 拿工作区去推会推出一根比任务栏高出一截的线，
-// 人就走进任务栏底下去了
-//
-// 开关本身住在上面的全局区：命令行解析要用它，定义得排在前面
-// 取第一个人所在的那块显示器。多屏的时候人站在哪块屏就沿哪块的边走，
-// 别拿主屏的数去套 —— 那样人会从这块屏飘到那块屏的底下去
-bool TaskbarLine(double& footY, double& loX, double& hiX) {
-    if (g_entities.empty()) return false;
-    RECT wr{};
-    if (!GetWindowRect(g_entities.front()->win->Handle(), &wr)) return false;
-    HMONITOR hm = MonitorFromRect(&wr, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(hm, &mi)) return false;
-    const RECT full = mi.rcMonitor;
-    const RECT work = mi.rcWork;
-    // 脚底踩在**任务栏顶沿**上，也就是工作区的底边。
-    //
-    // 屏幕最底沿（full.bottom）不行：那等于让人站在任务栏的下边缘里，身子
-    // 全压在任务栏上，看着像沉进去了。踩在 work.bottom 上，人是站在任务栏
-    // 这条台面上走，身子照常露在桌面上 —— 这才是"在任务栏上散步"
-    footY = (double)work.bottom;
-    // 没有任务栏（工作区等于整个屏幕）的时候退一步：贴屏幕底沿，留两像素
-    if ((double)work.bottom >= (double)full.bottom) footY = (double)full.bottom - 2.0;
-    loX = (double)full.left + TB_EDGE_PAD;
-    hiX = (double)full.right - TB_EDGE_PAD;
-    return hiX > loX;
+// 每个角色使用自己所属屏幕的工作区和当前 DPI。
+void ApplyTaskbarGeometry() {
+    for (auto& e : g_entities) {
+        DisplayArea area;
+        if (!ReadDisplay(e->monitor, area)) continue;
+        const auto line = TaskbarLedge(area, e->runner->LeftExtent(), e->runner->RightExtent());
+        e->runner->SetTaskbar(g_taskbar, line.y, line.left, line.right);
+    }
 }
 
-// 把这根线发给每个人。新开一个也要叫一次，否则他会照满屏那套乱逛
-void ApplyTaskbarGeometry() {
-    double footY = 0.0, loX = 0.0, hiX = 0.0;
-    const bool ok = g_taskbar && TaskbarLine(footY, loX, hiX);
-    for (auto& e : g_entities) e->runner->SetTaskbar(ok, footY, loX, hiX);
+void RefreshDisplays() {
+    // Keep the chosen monitor while it exists; unplugging falls back to the
+    // nearest surviving monitor, with Runner clamping to its work area.
+    DisplayArea spawn;
+    if (!ReadDisplay(g_spawnDisplay.handle, spawn)) {
+        const POINT p{g_spawnDisplay.work.left, g_spawnDisplay.work.top};
+        ReadDisplay(MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST), spawn);
+    }
+    if (spawn.handle) {
+        g_spawnDisplay = spawn;
+        g_opt.dpi = spawn.dpi / 96.0;
+        g_opt.k = g_userScale * g_opt.dpi;
+        g_opt.ox = spawn.work.left; g_opt.oy = spawn.work.top;
+        g_opt.worldW = spawn.work.right - spawn.work.left;
+        g_opt.worldH = spawn.work.bottom - spawn.work.top;
+    }
+    for (auto& e : g_entities) {
+        DisplayArea area;
+        if (!ReadDisplay(e->monitor, area)) {
+            const auto pos = e->runner->Pos();
+            POINT p{(LONG)std::lround(pos.x), (LONG)std::lround(pos.y)};
+            if (!ReadDisplay(MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST), area)) continue;
+            e->monitor = area.handle;
+        }
+        e->runner->SetDisplay(area.work, area.dpi / 96.0);
+    }
+    ApplyTaskbarGeometry();
+    g_displayDirty = false;
 }
 
 // 开这个模式：桌上只留一个，多的全请下去。反过来关掉的时候什么都不用补 ——
@@ -295,9 +323,14 @@ void SetTaskbarMode(bool on) {
         // "桌上只能有一个人"这条每次开都要再验一遍，不许拿"开关变没变"当判据：
         // --taskbar 起场的时候 g_taskbar 早就是 true 了，照那句判会直接跳过去，
         // 八个人全留在桌上，等于这个模式只改了线、没改人
-        while (g_entities.size() > 1) g_entities.pop_back();
+        bool kept = false;
+        for (auto it = g_entities.begin(); it != g_entities.end();) {
+            if ((*it)->runner->IsEnemy()) { ++it; continue; }
+            if (!kept) { kept = true; ++it; } else it = g_entities.erase(it);
+        }
+        RebuildPeers();
         // 漫步这一档没有武器这回事：拿着剑走那套图会在任务栏上打滑
-        SetAllArmed(false);
+
     }
     ApplyTaskbarGeometry();
 }
@@ -318,23 +351,57 @@ void AddAll() {
     ApplyTaskbarGeometry();
 }
 
+void ClearEnemies() {
+    for (auto it = g_entities.begin(); it != g_entities.end();) {
+        if (!(*it)->runner->IsEnemy()) { ++it; continue; }
+        const auto name = (*it)->name;
+        it = g_entities.erase(it);
+        for (const auto& skin : g_enemies) if (skin.name == name) StripCache::Shared().EvictSkin(skin.dir);
+    }
+    RebuildPeers(); g_enemySpawner.Clear();
+}
+
+bool AddEnemy(Faction faction = Faction::Unset, bool automatic = false) {
+    std::set<std::wstring> present;
+    for (const auto& e : g_entities) for (const auto& skin : g_enemies)
+        if (e->name == skin.name && e->runner->MyFaction() == skin.faction) present.insert(skin.dir);
+    // Failed skins are remembered, so a bad file cannot monopolize each interval.
+    for (size_t tries = 0; tries < g_enemies.size(); ++tries) {
+        const int picked = g_enemySpawner.Pick(g_enemies, present, faction, automatic);
+        if (picked < 0) return false;
+        const auto& skin = g_enemies[picked];
+        std::wstring error;
+        if (!ValidateEnemySkin(skin, error)) {
+            g_enemySpawner.Invalid(skin); OutputDebugStringW(error.c_str()); continue;
+        }
+        if (!AddEntity(skin)) return false;
+        g_enemySpawner.Used(skin); return true;
+    }
+    if (automatic) g_enemySpawner.Enable(false);
+    return false;
+}
+
+void RemoveGoneEnemies() {
+    for (auto it = g_entities.begin(); it != g_entities.end();) {
+        if (!(*it)->runner->Gone()) { ++it; continue; }
+        const auto name = (*it)->name;
+        it = g_entities.erase(it);
+        for (const auto& skin : g_enemies) if (skin.name == name) StripCache::Shared().EvictSkin(skin.dir);
+    }
+    RebuildPeers();
+}
+
 std::wstring FindIcon() {
     namespace fs = std::filesystem;
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     fs::path dir = fs::path(exe).parent_path();
     const wchar_t* locals[] = { L"falcom.ico", L"resource\\falcom.ico" };
-    for (int i = 0; i < 4 && !dir.empty(); ++i) {
-        for (const wchar_t* l : locals) {
-            std::error_code ec;
-            fs::path p = dir / l;
-            if (fs::is_regular_file(p, ec)) return p.wstring();
-        }
-        dir = dir.parent_path();
+    for (const wchar_t* local : locals) {
+        std::error_code ec;
+        const fs::path p = dir / local;
+        if (fs::is_regular_file(p, ec)) return p.wstring();
     }
-    std::error_code ec;
-    fs::path other = L"C:\\Users\\lxy_42\\source\\repos\\WpfTest\\WpfTest\\ed6_win_DX9_00001.ico";
-    if (fs::is_regular_file(other, ec)) return other.wstring();
     return L"";
 }
 
@@ -348,7 +415,13 @@ void Fail(const wchar_t* detail) {
     HANDLE h = CreateFileW(log.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE) {
-        const std::wstring line = std::wstring(detail) + L"\r\n";
+        SYSTEMTIME time{};
+        GetLocalTime(&time);
+        wchar_t stamp[40];
+        swprintf(stamp, 40, L"[%04u-%02u-%02u %02u:%02u:%02u] ",
+                 time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
+        const std::wstring line = std::wstring(stamp) + detail +
+            L"\r\nexe=" + exe + L"\r\ncommand=" + GetCommandLineW() + L"\r\n";
         DWORD n = 0;
         WriteFile(h, line.c_str(), (DWORD)(line.size() * sizeof(wchar_t)), &n, nullptr);
         CloseHandle(h);
@@ -407,6 +480,12 @@ void WriteStatsLine(double elapsed) {
     std::wstring all = head;
     for (const auto& e : g_entities) {
         const Runner::Stats& s = e->runner->GetStats();
+        wchar_t battle[256];
+        swprintf(battle, 256, L"  combat name=%s faction=%s entity=%llu target=%llu hp=%d/%d down=%d entering=%d attacks=%llu\n",
+            e->name.c_str(), FactionName(e->runner->MyFaction()), e->runner->EntityId(), e->runner->TargetId(),
+            e->runner->Hp(), e->runner->MaxHp(), e->runner->Downed(), e->runner->Entering(), e->runner->Attacks());
+        all += battle;
+
         RECT wr{};
         const bool haveRect = GetWindowRect(e->win->Handle(), &wr) != FALSE;
         // 气泡的矩形只有这里量得到：它自己一个窗口，角色的 rect= 里问不出它。
@@ -512,6 +591,9 @@ void DumpCrops(const std::wstring& skin) {
 // 托盘和"退出"这两件事都得有个拆不掉的宿主，所以专门开一个窗口：它不上屏、
 // 不进 alt-tab，只收 WM_TRAY。角色窗口是随时能加能删的，靠不住
 LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_DISPLAYCHANGE || msg == WM_SETTINGCHANGE || msg == WM_DPICHANGED) {
+        g_displayDirty = true;
+    }
     if (msg == Tray::WM_TRAY) {
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) {
             g_tray.Popup();
@@ -589,6 +671,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     bool dumpCell = false;
     bool debugFrame = false, debugFull = false, debugMarks = false;
     int tickMs = DEFAULT_TICK_MS;
+    int monitorIndex = 1;
+    int enemyBoot = 0, enemy1Boot = 0, enemy2Boot = 0;
+    double enemyAutoSec = 0;
     // --key value 这种空格写法以前会被 ValueOf 判成空 —— 于是 --skin 形同没传，
     // PickSkin 走 QueryPerformanceCounter^GetTickCount64 随机挑一套图。调试时
     // 拿这套东西测出来的结论全是假的，所以先在本地把两个 token 并成一个。
@@ -615,6 +700,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         else if (!(v = ValueOf(a, L"--skin")).empty()) skinArg = v;
         else if (!(v = ValueOf(a, L"--scale")).empty()) scalePct = _wtof(v.c_str());
         else if (!(v = ValueOf(a, L"--tick")).empty()) tickMs = (int)_wtoi(v.c_str());
+        else if (!(v = ValueOf(a, L"--monitor")).empty()) monitorIndex = (int)_wtoi(v.c_str());
+        else if (!(v = ValueOf(a, L"--enemy")).empty()) enemyBoot = (std::max)(0, _wtoi(v.c_str()));
+        else if (!(v = ValueOf(a, L"--enemy1")).empty()) enemy1Boot = (std::max)(0, _wtoi(v.c_str()));
+        else if (!(v = ValueOf(a, L"--enemy2")).empty()) enemy2Boot = (std::max)(0, _wtoi(v.c_str()));
+        else if (!(v = ValueOf(a, L"--enemyauto")).empty()) enemyAutoSec = _wtof(v.c_str());
         else if (IsFlag(a, L"--wander")) wander = true;
         else if (IsFlag(a, L"--armed")) g_armed = true;
         else if (IsFlag(a, L"--smooth")) smooth = true;
@@ -657,10 +747,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         static const wchar_t* usage =
             L"FalcomDeskling —— 低资源桌面小人\n\n"
             L"  --root=<路径>   人物目录，默认看 exe 旁边的 chr\\\n"
-            L"  --enemyroot=<路径> 敌人目录，默认看 exe 旁边的 Enemy\\（只建索引，不进菜单）\n"
+            L"  --enemyroot=<路径> 敌人目录，包含 Enemy1/Enemy2 的父目录，默认 exe 旁\n"
             L"  --skin=<名字>   指定角色目录，逗号分开可一次起好几个人（默认随机一个）\n"
             L"  --scale=<百分比> 显示倍率，默认 200（=WPF 的 ScaleFactor 2.0）\n"
-            L"  --tick=<毫秒>   主循环周期，默认 15；想再省 CPU 就 33\n"
+            L"  --tick=<毫秒>   主循环周期，默认 33\n"
+            L"  --monitor=<序号> 活动显示器，默认 1（主屏）；其余按左、上坐标排序\n"
             L"  --wander        走路时也每 1.5 秒自己换向\n"
             L"  --armed         起场就装备武器（缺那两套图的人自己退回走/跑）\n"
             L"  --smooth        放大用 HALFTONE 滤波，默认最近邻\n"
@@ -690,7 +781,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
             L"  --stack         所有人开在同一只脚底下（验同伴推开用）\n"
             L"  --noseparate    关掉同伴推挤和绕人，做对照实验用\n"
             L"  --hit           隔一会儿打后面的人一下，验 <react> 那张反应表\n"
-            L"  --taskbar       任务栏漫步：只留一个人，沿屏幕底边慢速来回走\n";
+            L"  --enemy=N       启动时随机加入 N 个敌人\n"
+            L"  --enemy1=N / --enemy2=N 分别加入指定阵营\n"
+            L"  --enemyauto=秒  开启自动生成（托盘可调整，默认间隔10秒）\n"
+            L"  --taskbar       任务栏漫步：一个chr与敌人沿工作区底沿活动\n";
         DWORD n = 0;
         HANDLE so = GetStdHandle(STD_OUTPUT_HANDLE);
         if (so && so != INVALID_HANDLE_VALUE) {
@@ -699,7 +793,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         return 0;
     }
     if (argc > 0 && argv) LocalFree(argv);
-    if (!(scalePct > 0.0)) scalePct = DEFAULT_SCALE * 100.0;
+    if (!std::isfinite(scalePct) || !(scalePct > 0.0)) scalePct = DEFAULT_SCALE * 100.0;
+    scalePct = (std::min)(scalePct, 800.0);
+    g_userScale = scalePct / 100.0;
     if (tickMs < 5) tickMs = 5;
 
     // 显式路径要在任何一次扫描之前交进去，晚一步就会被先前的猜测吃掉
@@ -710,9 +806,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         return 1;
     }
     // 名单一次扫干净：托盘里"添加"要用的就是这份表
-    g_skins = ScanChr();
+    std::wstring scanDiagnostic;
+    g_skins = ScanChr(&scanDiagnostic);
     if (g_skins.empty()) {
-        Fail((L"这个目录里没有带 2.Walk 的人：\n" + root).c_str());
+        Fail((L"未识别到可用角色：\n" + root + L"\n\n" + scanDiagnostic +
+              L"\n\n若使用便携包，请完整解压并保留 exe 旁的 chr 文件夹。").c_str());
         return 1;
     }
     // 敌人只建索引：一张图都不解，也不进"添加"菜单。这一步先把这条线立起来，
@@ -752,11 +850,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     if (starters.empty()) {
         // 没点名就随机一个。注意这里只从 g_skins 里挑：名单已经扫过一遍了，
         // 再自己扫一次目录就是两处扫法，早晚会对不上
+        const std::wstring chosen = PickSkin(g_skins, skinArg);
         for (const SkinInfo& s : g_skins) {
-            if (s.dir == PickSkin(g_skins, skinArg)) { starters.push_back(s); break; }
+            if (s.dir == chosen) { starters.push_back(s); break; }
         }
         if (starters.empty()) {
-            Fail((L"这个目录里没有带 2.Walk 的人：\n" + root).c_str());
+            Fail((L"未找到指定角色：" + skinArg + L"\n人物目录：" + root).c_str());
             return 1;
         }
     }
@@ -793,9 +892,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         return 0;
     }
 
-    RECT wa{};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    const UINT dpi = GetDpiForSystem();
+    const auto displays = Displays();
+    if (monitorIndex < 1 || monitorIndex > (int)displays.size()) {
+        Fail(L"--monitor 超出范围：1 是主屏，其余显示器从 2 开始。");
+        return 1;
+    }
+    g_spawnDisplay = displays[monitorIndex - 1];
+    const RECT wa = g_spawnDisplay.work;
+    const UINT dpi = g_spawnDisplay.dpi;
     const double dpiScale = (double)dpi / 96.0;
     const double k = (scalePct / 100.0) * dpiScale;
 
@@ -890,7 +994,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     // 这条开关值这个钱：遭遇的判据是"谁 + 多远"，光靠随机走位根本复现不了一条
     // 规则。把它钉在左边两个身长，就是在验 far 那一行；钉在半身长，就是在验
     // near 那一行。不用为了凑距离在桌上追半小时
-    if (!peerArg.empty()) {
+    if (!peerArg.empty() && !g_taskbar) {
         const SkinInfo* want = nullptr;
         for (const SkinInfo& s : g_skins) {
             if (s.name == peerArg) { want = &s; break; }
@@ -959,7 +1063,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     g_tray.isTaskbar = [] { return g_taskbar; };
     // 漫步模式下桌上只能有一个人，所以"还能不能再加"这件事由这里说，
     // 菜单自己不许再判一遍
-    g_tray.canAdd = [] { return !g_taskbar; };
+    g_tray.canAdd = [] { return FriendlyCount() < (size_t)g_maxEntities && (!g_taskbar || FriendlyCount() == 0); };
+    g_tray.onEnemyAdd = [](int which) {
+        if (!AddEnemy(which == 1 ? Faction::Enemy1 : which == 2 ? Faction::Enemy2 : Faction::Unset))
+            MessageBoxW(g_msg, L"没有可加入的敌人。请确认 Enemy1 / Enemy2 素材完整，且未全部在场。", L"FalcomDeskling", MB_ICONINFORMATION);
+    };
+    g_tray.onEnemyClear = [] { ClearEnemies(); };
+    g_tray.enemyAuto = [] { return g_enemySpawner.Enabled(); };
+    g_tray.enemyInterval = [] { return g_enemySpawner.Interval(); };
+    g_tray.onEnemyAuto = [](bool on) { g_enemySpawner.Enable(on); };
+    g_tray.onEnemyInterval = [](double seconds) { g_enemySpawner.SetInterval(seconds); };
 
     // 表情墙是内嵌资源，解不出来不致命：气泡从此一声不响，但人还在走。
     // 这一句得说出来，否则"为什么没有泡泡"只能靠猜
@@ -967,6 +1080,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         OutputDebugStringW(EmotionSheet::Shared().Fault().c_str());
     }
     if (g_emoteBoot > 0) ShowAllEmote(g_emoteBoot);
+    for (int i = 0; i < enemyBoot && i < (int)g_enemies.size(); ++i) if (!AddEnemy()) break;
+    for (int i = 0; i < enemy1Boot && i < (int)g_enemies.size(); ++i) if (!AddEnemy(Faction::Enemy1)) break;
+    for (int i = 0; i < enemy2Boot && i < (int)g_enemies.size(); ++i) if (!AddEnemy(Faction::Enemy2)) break;
+    if (std::isfinite(enemyAutoSec) && enemyAutoSec > 0) { g_enemySpawner.SetInterval(enemyAutoSec); g_enemySpawner.Enable(true); }
+
 
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
                                           CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
@@ -984,6 +1102,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&last);
     const LARGE_INTEGER boot = last;
+    ULONGLONG nextDisplayCheck = 0;
 
     for (;;) {
         const DWORD r = MsgWaitForMultipleObjects(1, &timer, FALSE, INFINITE, QS_ALLINPUT);
@@ -996,6 +1115,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
                 DispatchMessageW(&msg);
             }
             if (g_quit) break;
+
+            const ULONGLONG clock = GetTickCount64();
+            if (g_displayDirty || clock >= nextDisplayCheck) {
+                RefreshDisplays();
+                // Also catches taskbar auto-hide and DPI changes without a
+                // broadcast to our off-screen tray host.
+                nextDisplayCheck = clock + 500;
+                for (auto& e : g_entities) e->runner->Present();
+            }
 
             QueryPerformanceCounter(&now);
             double dt = (double)(now.QuadPart - last.QuadPart) / (double)freq.QuadPart;
@@ -1019,6 +1147,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
                 // 躲只在跑步态生效，走路撞上了就靠这一处兜着：所有实体都跑完
                 // 这一拍之后，两两看一眼，重叠了就把多的那一截一人推一半
                 Runner::SeparateAll();
+                if (g_enemySpawner.Tick(dt)) AddEnemy(Faction::Unset, true);
+                RemoveGoneEnemies();
                 QueryPerformanceCounter(&t1);
                 for (auto& e : g_entities) e->runner->Present();
                 g_usPhysics += (uint64_t)((double)(t1.QuadPart - t0.QuadPart) * 1e6 /

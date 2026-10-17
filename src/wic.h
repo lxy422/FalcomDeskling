@@ -43,10 +43,11 @@ bool DecodePngMemory(const void* data, size_t len, Strip& out);
 // 六套：走/跑/武器走/武器跑，加上出拳和胜利 —— 后两套以前不列进来是因为
 // 没有分支会用到它们，白扫一堆图。现在任务栏漫步要停下来摆姿势，用得上，
 // 所以补进这张表（挨打和跪那两套还是没接，等 <react> 真跑起来再说）。
-enum class Art { Walk, Run, Standby, Run2, Attack, Victory };
+enum class Art { Walk, Run, Standby, Run2, Attack, Victory, Down, BeAttacked, Kneel2 };
 
 const wchar_t* FolderOf(Art a);
-inline constexpr int ART_COUNT = 6;
+double AnimationRate(Art a);
+inline constexpr int ART_COUNT = 9;
 
 // 反着找：配置里写的是目录名，代码里要的是枚举。认不出来给 false，
 // 别让它猜一个 —— 转移表里指错一套动作，会比什么都不做更难查
@@ -104,6 +105,7 @@ public:
     // 命中返回已有的那份，未命中解码一份，失败返回空
     StripPtr Get(const std::wstring& path);
     void Clear() { _items.clear(); _bytes = 0; }
+    void EvictSkin(const std::wstring& dir);
     size_t Bytes() const { return _bytes; }
     void SetBudget(size_t bytes) { _budget = bytes; Trim(); }
 

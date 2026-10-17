@@ -8,7 +8,7 @@
 namespace fd {
 
 // 一个角色一个分层窗口，只盖住它自己那格贴图。
-// 位置变了只调 MoveTo（零像素上传），只有换帧才 Present 上传一次 —— 这就是低消耗的全部来源。
+// 默认移动时上传表面；静止且未换帧时跳过呈现，--move 可切回只移动窗口。
 class LayeredWindow {
 public:
     ~LayeredWindow() { Destroy(); }
@@ -21,6 +21,7 @@ public:
 
     void MoveTo(int x, int y);
     bool Present(int x, int y);
+    void SetOpacity(BYTE opacity) { _opacity = opacity; }
 
     // 裁剪框换了尺寸就得重做表面，这是唯一一处会改窗口大小的地方
     bool Resize(int w, int h);
@@ -52,6 +53,7 @@ private:
     int _lastX = -1, _lastY = -1;
     const char* _failStep = "none";
     DWORD _gle = 0;
+    BYTE _opacity = 255;
 };
 
 }  // namespace fd

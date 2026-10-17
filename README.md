@@ -1,140 +1,130 @@
 # FalcomDeskling
 
-低资源的 Win32 桌面小人，用来替换 `WpfTest` 那套 VB.NET/WPF 实现。
-Phase 1 只做一件事：**一个角色在屏幕里随机走、撞边拐弯、靠近鼠标就跑**。
+低资源的 Windows 桌面小人程序，使用 C++17、Win32 分层窗口和 WIC。支持八方向行走、鼠标避让、多角色同场、表情气泡、武器切换，以及任务栏漫步和三阵营自动战斗。
+
+## 直接运行
+
+解压便携包到有写入权限的目录，运行：
+
+- `Taskbar.cmd`：一个角色沿工作区底沿慢速散步，偶尔停下、摆胜利姿势或冒表情。
+- `Desktop.cmd` 或 `FalcomDeskling.exe`：一个随机角色在桌面活动，靠近鼠标会避让。
+
+托盘左键暂停/继续；右键菜单可以切换任务栏漫步、装备武器、显示表情、添加/移除角色或退出。默认点击穿透，不抢输入焦点。
+
+任务栏模式只保留第一个 chr，但允许多个 Enemy1/Enemy2 同场；关闭后回到桌面活动。被移除的其他 chr 需要从托盘重新添加，敌人的 HP 和倒地进度会保留。没有胜利素材时继续散步，不会用攻击动作替代。
 
 ## 构建
 
-```
-build.cmd          Release（/O2 /MT，静态 CRT）
-build.cmd debug    Debug
-```
+需要 Windows 10/11、包含 C++ 工具链和 Windows SDK 的 Visual Studio 或 Build Tools。
 
-产物在 `build\bin\FalcomDeskling.exe`，图标会一并拷过去。
-`Chr` 资源目录默认在 exe 旁边找，也可以 `--root=` 指到 `WpfTest\Resource\Chr`。
-
-> 这台机器上的 VS2022 Community 的 C++ 组件是半残的（`cl.exe` 在，
-> `vcvarsall.bat` 和 include 不在），所以 `build.cmd` 靠**文件存在性**
-> 去挑可用的 MSVC 装件，而不是信 vswhere 的 `isComplete`。
-
-## 运行
-
-```
-FalcomDeskling.exe                      默认：33ms 一拍，200% 尺寸，鼠标避让
-FalcomDeskling.exe --tick=15            贴回 WPF 的 66fps 节奏
-FalcomDeskling.exe --scale=100          半尺寸
-FalcomDeskling.exe --skin=科洛丝        指定角色
-FalcomDeskling.exe --stats              每秒往 exe 旁写一行自采样
+```bat
+build.cmd          REM Release，/O2 /MT，静态 CRT
+build.cmd debug    REM Debug
+build.cmd test     REM Release + 显示几何、DPI、漫步和内存回归测试
+build.cmd test build\alternate  REM 指定独立输出目录，避免覆盖运行中的程序
 ```
 
-托盘图标：左键暂停/继续，右键退出。
+产物在 `build\bin\FalcomDeskling.exe`。测试使用仓库内的 `testdata\ChrBig`，无需完整外部人物包。脚本可从其他工作目录调用。
 
-完整参数列表见 `FalcomDeskling.exe --help`。
+开发构建优先使用已有的 `build\bin\chr` 和 `Enemy`。不存在时，尝试为相邻 `..\WpfTest\Resource\Chr` / `Enemy` 建立目录联接。这只是开发便利；运行程序不依赖 WpfTest，也不会自行搜索开发机上的资源路径。
 
-## Phase 1 移植了什么
+## 资源布局
 
-行为全部对着 `WpfTest` 抄，常量都集中在 `src/config.h`：
+```text
+FalcomDeskling.exe
+falcom.ico
+chr/
+  角色目录名/
+    1.Run/dir0.png ... dir7.png
+    2.Walk/dir0.png ... dir7.png
+    character.xml                  可选
+    ...                            其他可选动作
+Enemy1/CH04500/                   编号 < 10000，10 HP
+Enemy2/CH10000/                   编号 >= 10000，5 HP
+```
 
-| 项目 | 值 | 出处 |
-|---|---|---|
-| 方向数 | 8 | `RunnerEntity.vb` |
-| 走路速度 | 300 px/s | 同上 |
-| 跑步速度 | 900 px/s | 同上 |
-| 显示倍率 | 2.0 | `MainWindow.xaml` ScaleFactor |
-| 帧率 | 走 12fps / 跑 20fps | `SpriteSheet.vb` |
-| 贴图格 | 256×256，中心 x=128，脚底 y=175 | 同上 |
-| 鼠标迟滞 | 2 个身位内跑，4 个身位外走回 | `RunnerEntity.vb` |
-| 撞边 | 加权随机选向 + 角落锁定 0.9s | 同上 |
+角色素材应提供完整八方向的走/跑图；仅有 `2.Walk/dir0.png` 的目录也会被枚举，但缺少其他方向或动作会影响显示。PNG 是横向拼帧，单格边长取图片高度，支持不同格径；人物的中心线和脚底线按原始 256 格的比例换算。武器需同时具有 `4.standby` 和 `5.run2` 对应素材。
 
-`--wander` 对应 WPF 的 `MouseMode.Off`：这条路上**只逛不躲**，距离被强制成
-无穷，所以永远不会进跑步态。默认不开，也就是 Escape 模式——走路时不主动转向，
-只有撞墙或被鼠标蹭到才改方向，这点和 `UpdateFlee` 的 `Select Case` 一致。
+`character.xml` 可设置速度、鼠标模式、动作开关、表情、遭遇规则和状态转移；配置缺省时回到内置值。可用 `--dumpconfig` 查看最终值及其来源，`--no-config` 验证内置基线。九种动作均已接入；敌人缺少专用走路/跑步/休息/胜利素材时使用现有动作替代。[三阵营战斗说明](docs/combat.md)列出 HP、复起和生成规则。
 
-## 架构：为什么和 WPF 长得不一样
+## 常用参数
 
-WPF 那版是一个铺满屏幕的透明窗口加 `DrawingVisual`。这里换成
-**每个角色一个小分层窗口**：
+```bat
+FalcomDeskling.exe --skin=科洛丝
+FalcomDeskling.exe --skin=all --max=8
+FalcomDeskling.exe --taskbar --monitor=2 --scale=150
+FalcomDeskling.exe --root="D:\Falcom Art\Chr"
+FalcomDeskling.exe --wander --tick=15
+FalcomDeskling.exe --stats
+FalcomDeskling.exe --enemy1=1 --enemy2=2 --enemyauto=10
+FalcomDeskling.exe --taskbar --enemy=3 --enemyauto=10
+```
 
-- 位置变了 → `UpdateLayeredWindow` 顺带把 `ptDst` 定过去
-- 帧变了 → 重拷一次表面
-- 什么都不变 → 什么都不做
+| 参数 | 行为 |
+|---|---|
+| `--skin=名字` | 选择角色；支持逗号分隔或 `all`，默认随机一个 |
+| `--root=路径` | 人物根目录，默认 exe 旁的 `chr` |
+| `--enemyroot=路径` | 包含 `Enemy1`、`Enemy2` 的父目录，默认 exe 所在目录；兼容旧 Enemy 根目录 |
+| `--enemy=N` | 启动时随机加入 N 个敌人 |
+| `--enemy1=N` / `--enemy2=N` | 启动时加入指定阵营的敌人 |
+| `--enemyauto=秒` | 开启自动生成，托盘也可开关和调整间隔 |
+| `--taskbar` | 开启任务栏漫步 |
+| `--monitor=N` | 选择活动屏幕；1 为主屏，其余按左坐标、上坐标排序 |
+| `--scale=N` | 显示倍率百分比，默认 200，最大 800；再乘所在屏幕的 DPI 比例 |
+| `--tick=N` | 更新周期毫秒，默认 33，最小 5；15 更流畅但开销更高 |
+| `--wander` | 桌面模式主动随机转向，不躲鼠标 |
+| `--armed` | 启动时装备武器，需有对应素材 |
+| `--max=N` | 最大同场人数，默认 8 |
+| `--smooth` | 使用 HALFTONE 缩放，默认最近邻 |
+| `--notop` | 关闭置顶 |
+| `--stats` | 每秒在 exe 旁写运行统计 |
+| `--help` | 输出完整参数，包括诊断开关 |
 
-PNG 解码走 WIC，只解当前方向那条横向条带，最多缓存 2 条（LRU），
-避免八方向全解码把内存吃光。
+参数同时支持 `--key=value` 与 `--key value`。
 
-窗口尺寸和锚点**不按单条 strip 算**，而是开机扫全部 16 条求一个全局并集框，
-一次定死 —— 见下面性能实测第 2 条。
+## 多屏与任务栏行为
 
-**方格边长从图自己读，不是写死 256。** 横向拼帧的约定是「格高 == 图高」，
-所以 `cell = h`、`frames = w / h`；中心线、脚底线、身长、半宽这些按 256 定的
-常量全部乘 `cell/256` 换算。以前 `cellH = min(256, h)` 的写法，塞进一个 512
-格径的角色就会把 cell 压成 256、frames 算成 16，`AlphaBox` 只扫最上面 256 行
-—— 放大后的脚底线在 350 行，**整条腿连框都进不去**。
-`tools\probe_mkskin.ps1` 能把任意皮肤放大 N 倍造出不同格径的测试皮肤，
-`--root=...\testdata --skin=ChrBig` 就能验。
+角色在所选显示器的工作区内活动，支持位于主屏左边或上边的负坐标屏幕。显示器、工作区和 DPI 发生变化时重新计算尺寸与边界；检查周期最多约半秒。移除当前显示器后，角色回到最近的可用显示器，新增角色也使用更新后的活动区。
 
-## 性能实测（这台机器，3840×2400 @200%）
+任务栏漫步和战斗以工作区底沿作为脚底线。底部任务栏时踩在任务栏上沿；顶部、侧面任务栏或无任务栏时，沿工作区底部散步。左右端点为整个角色留出空间。自动隐藏任务栏时按 Windows 报告的工作区定位，不追随任务栏弹出动画。
 
-`tools\bench_final.ps1` 跑出来的，单位是单核百分比：
+漫步中更新几何不会重播动作；暂停时仍能适应显示变化，刷怪、复起和死亡计时同时冻结。走路动画为 6fps，胜利动作只播放一次后停留。角色过宽、没有可走距离时保持原地。若缩放大到角色本身超过屏幕尺寸，仍可能超出屏幕，需减小 `--scale`。
 
-| 配置 | CPU | 备注 |
-|---|---|---|
-| `--nopresent`（只算不画） | **0.4~0.7%** | 物理那部分是干净的 |
-| 默认（33ms + 每拍重传） | **2.9%** | 16MB（全局框后不再每拍 Resize） |
-| `--tick=15` | 7~8% | 66fps |
-| `--move --tick=15` | 11% | 见下面那条 |
-| **WpfTest Debug 版** | **55.16%** | **320MB** |
+当前选择屏幕通过启动参数完成，不支持跨屏自由游走或托盘内切屏。真实混合 DPI 多屏与热插拔仍建议在目标设备上验收；自动化回归覆盖合成几何、运行时 DPI 切换和当前连接屏幕的枚举。
 
-两个和预期不一样的结论，都是量出来的：
+## 制作独立便携包
 
-1. **`SetWindowPos` 挪一个分层窗口要 2.0~2.3ms，`UpdateLayeredWindow`
-   整张重传只要 1.0ms。** 所以"多数帧只搬窗口不动像素"这条省资源的路
-   在这台机器上是**反效果**，默认改成每拍都重传，快了一倍。
-   `--move` 留着，想验证就切回去。
-2. **256×256 那格里只有约 86×88 像素是真东西**，剩下八成是透明的。
-   解码时按帧扫一遍 alpha 求并集包围盒，窗口和拷贝都只覆盖这一块，
-   一次上传从 4MB 降到 0.5MB。这是单点最大的开销削减。
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\package.ps1
+powershell -ExecutionPolicy Bypass -File tools\package.ps1 -ChrRoot "D:\Art\Chr"
+powershell -ExecutionPolicy Bypass -File tools\package.ps1 -EnemyRoot "D:\Art"
+```
 
-   但**不能按单条 strip 各自求框**：科洛丝八条 walk 的 cropH 在 83~91 之间跳，
-   cropY 在 90~95 之间跳，每换一次方向就要 Resize 一次窗口，锚点 `cropY-175`
-   跟着跳 —— 落在屏幕上就是"下半截没了"。`Resize` 里那句 `SetWindowPos` 带
-   `SWP_NOMOVE`，尺寸变了位置不动，窗口从旧原点往下长出一截 memset 的透明区。
-   现在改成开机扫全部 16 条求一个**全局框**，窗口尺寸和锚点全程恒定，
-   `max(maxY, SPRITE_FEET_Y)` 那条兜底也一并删了。
-   框比单条的大，但省掉了每拍的 Resize，CPU 反而从 3.3~4.0% 降到 2.9%。
+输出为 `dist\FalcomDeskling-时间-随机后缀.zip`，包含 exe、图标、人物素材、启动脚本、README 和 SHA256 校验清单和历史记录文档。复制实际文件，不携带开发目录联接；每次生成新包，不覆盖旧版本。默认同时包含 Enemy1、Enemy2 素材；`-OmitEnemies` 可制作纯角色包。`-EnemyRoot` 指向这两个文件夹的父目录。已有可执行文件时使用 `-SkipBuild` 跳过构建。
 
-   **注意**：上面这条 Resize 机制虽然真实存在，但它**不是**"缺脚"的真凶。
-   真凶在 `Blit` 里：`StretchDIBits` 把源矩形的 y 当成 bottom-up 来定位，
-   传 `srcY=95` 它实际从 `256-95-84=77` 行开始读，内容整体往下挪 18 行，
-   脚底那一段被窗口下沿截掉。判据很硬：源格内容在 `y[103..174]`，按 `srcY=95`
-   该落在表面 `y[32..316]`，实测却在 `y[104..335]` 且顶到底边，而
-   `104 = (103-77)*4`。`--debugfull`（整格不裁，`srcY=0/srcH=256`）翻回去
-   还是 0，所以那条路一直是对的 —— 这也解释了为什么只有裁剪会掉内容。
-   现在 `srcY` 传 `height-(b.y+b.h)` 做反向补偿，GDI 再翻一次正好落回 `b.y`。
-   改完之后 8 个角色 × 25 对逐帧比对，预测和实测偏差全为 0。
+使用独立输出目录时，给打包脚本加 `-BuildRoot build\alternate -SkipBuild`，从该目录读取 exe。独立构建目录和生成的便携包均可在使用完毕后删除。
 
-   缓存那边顺手修了一处：以前 `StripCache::Get` 发的是 `deque` 里的裸指针，
-   `erase` 一挪槽位，"指针还有效、内容已经是另一条 strip"就会悄悄发生，而
-   `LoadFrames` 里 `path == _stripPath` 又让它每拍都跳过修正。现在发
-   `shared_ptr`，淘汰只放掉缓存自己那份引用。
+分发包只需解压即可运行，不要求安装 Visual Studio、WpfTest 或单独的 VC 运行库。请使用自己有权使用和分发的素材。
 
-物理本身（速度、撞边、避让、随机）几乎不花钱，`--nopresent` 那条就是它的地板。
-剩下的全是窗口呈现，而目标 `<0.5%` 只有在这一档才够得到——只要还想每拍把画面
-弄到屏上，就绕不开那 1ms 一次的重传。
+## 实现与验证
 
-## 工具
+每个角色一个小分层窗口。启动时扫描可用动作，计算统一的非透明包围盒；绘制只覆盖裁剪区域。PNG 条带按需解码，缓存按字节预算淘汰，角色用共享引用持有正在播放的条带。表情图集内嵌 exe；[表情编号与事件对应表](docs/emotes.md)及[逐帧图形对照表](docs/emotes.html)列出全部 18 组。
 
-- `tools\bench_final.ps1` 主基准，直接读 `--stats` 的自采样算每次调用成本
-- `tools\bench.ps1` 按 `--scale` 扫一遍
-- `tools\bbox.ps1` 量贴图条带里 alpha 非零的范围
+移动时默认用 `UpdateLayeredWindow` 同时上传和定位；静止且未换帧时跳过上传。`--move` 可改走移动窗口路径进行对照，`--nopresent` 仅运行逻辑。
 
-调试用的那批 `probe_*.ps1` 定位完已经清掉了。要再查几何问题，靠
-`--debugframe` / `--debugmarks` 直接在屏幕上画线最快：品红是窗口四边、
-绿是脚底线、青是中心线、黄/白是这一拍内容真正的首末行。
+- `build.cmd test`：显示/DPI、表情 236 组逐像素比较、三阵营 HP/寻敌/复起/任务栏战斗、刷怪调度、实际敌人素材校验及 1000 次内存解码回归。
+- `tools\check_battle_live.ps1`：使用真实素材实跑桌面和任务栏战斗、检查自动生成、HP 与任务栏脚底线。
+- `tools\check_package.ps1 -Zip <zip路径>`：解压到独立的含空格路径，校验所有文件并验证配置加载和漫步运行。
+- `tools\check_taskbar.ps1`：实际运行下验证单角色、水平移动、慢速和端点转向。
+- 其他 `tools\check_*.ps1`：配置、表情、状态和渲染诊断。部分旧脚本会停止所有同名进程，运行前留意已有桌面角色。
+- [历史性能与裁剪排障记录](docs/performance-history.md)：早期测量，不能直接代表当前版本。
 
-## 已知边界
+托盘“敌人”菜单支持随机加入、指定阵营加入、自动增加、间隔选择和清场。自动生成默认关闭，间隔默认 10 秒，可选 1/5/10/20/30/60/120 秒。尚未实现用户偏好保存和开机启动。
 
-- Phase 1 只有一个角色，多角色、点击交互、状态机其余分支还没接
-- 33ms 一拍意味着 600px/s 的速度每步走 20px，比 WPF 的 66fps 略糙；
-  介意的话 `--tick=15`，代价是 CPU 翻到 7%
-- 撞边判定按物理像素做，多显示器混合 DPI 还没测
+## 启动时未识别到角色
+
+当前版本也修正了旧版随机选人时在遍历中反复抽签、误报“没有带 2.Walk 的人”的问题；连续 30 次随机启动已验证。程序默认查找 exe 旁的 `chr\角色名\2.Walk\dir0.png`，不是从命令行当前目录找。便携包需要完整解压；只复制 exe 会丢失外部人物素材。`--root` 应指向包含多个角色目录的 `chr`，不能指向单个角色或 `2.Walk`。
+
+可运行 `powershell -ExecutionPolicy Bypass -File tools\check_startup.ps1`，验证当前 exe 从不同工作目录都能识别人物。报错会记录到 exe 旁的 `falcomdeskling_error.txt`，新记录包含时间、实际 exe 路径、启动参数、枚举数量和缺失文件样例。报告问题时保留完整路径与最新一段日志，便于区分不同目录中的程序副本。
+
+旧 Enemy 目录可用 `powershell -ExecutionPolicy Bypass -File tools\split_enemies.ps1` 分组，脚本保存移动清单，CH10000 归入 Enemy2。仅移动指定 bin 内的真实资源目录；不会移动外部目录联接的目标。

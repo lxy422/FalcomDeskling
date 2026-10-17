@@ -72,6 +72,12 @@ public:
     ActionFn onQuit;
     // 点谁放谁：桌上不止一个人的时候一次全放，逐张验才不用挨个戳
     EmoteFn onEmote;
+    std::function<void(int)> onEnemyAdd;
+    ActionFn onEnemyClear;
+    std::function<void(bool)> onEnemyAuto;
+    std::function<bool()> enemyAuto;
+    std::function<void(double)> onEnemyInterval;
+    std::function<double()> enemyInterval;
 
 private:
     HWND _hwnd = nullptr;

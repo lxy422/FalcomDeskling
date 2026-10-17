@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.h"
+#include "faction.h"
 #include "emote.h"
 #include "wic.h"   // Art：转移表里要指哪套动作
 
@@ -22,21 +23,9 @@ namespace fd {
 // config.h 里那几个常量**。老行为是默认行为，配置文件只写差异，
 // 不许悄悄把人换成另一套脾气。
 
-// ---- 阵营：从 id 派生，不是第二个字段 ----
-//
-// 路线图第 4 步原本写的是"Entity 加一个 bool isEnemy"。这里**故意偏离**：
-// 那个 bool 只能是 FactionOf(id) != Ally 的别名，两处定义迟早会对不上，
-// 出现"血条有、遭遇表里却当她是我方"这类查不动的账。
-enum class Faction : int {
-    Wild      = -1,  // 只能出现在查找规则里，真 id 不会用到负数
-    Unset     = 0,   // 没写过
-    Ally      = 1,   // 1..100
-    EnemyChar = 2,   // 101..200
-    Monster   = 3,   // 201..1000
-};
-
-// 区间的唯一出处。将来想加一段"友方 NPC 1001..2000"只动这张表，
-// 不许在别处出现字面量 100 / 200 / 1000。
+// Runtime faction follows Chr/Enemy1/Enemy2 roots. Numeric bands below are
+// only the legacy XML rule lookup convention; instances carry their faction
+// independently of the material id (different camps may share numeric ids).
 struct FactionBand {
     int     lo = 0;
     int     hi = 0;

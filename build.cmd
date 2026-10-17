@@ -8,8 +8,10 @@ rem  in the system codepage, so any non-ASCII byte in a comment
 rem  can decode into '(' and break the parser.
 rem ============================================================
 setlocal
+cd /d "%~dp0"
 set SRC=src
 set OUT=build
+if not "%~2"=="" set "OUT=%~2"
 set EXE=%OUT%\bin\FalcomDeskling.exe
 
 rem ---------- pick a *complete* MSVC install ----------
@@ -34,7 +36,7 @@ if not exist "%OUT%\obj" mkdir "%OUT%\obj"
 if not exist "%OUT%\bin" mkdir "%OUT%\bin"
 
 echo [..] compiling
-cl /nologo /std:c++17 /EHsc /utf-8 /W3 /DUNICODE /D_UNICODE %OPTS% /Fo"%OUT%\obj\\" "%SRC%\main.cpp" "%SRC%\window.cpp" "%SRC%\wic.cpp" "%SRC%\runner.cpp" "%SRC%\tray.cpp" "%SRC%\store.cpp" "%SRC%\emote.cpp" "%SRC%\charconf.cpp" "%SRC%\xml.cpp" /link /SUBSYSTEM:WINDOWS /OUT:"%EXE%" user32.lib gdi32.lib shell32.lib windowscodecs.lib ole32.lib oleaut32.lib
+cl /nologo /std:c++17 /EHsc /utf-8 /W3 /DUNICODE /D_UNICODE %OPTS% /Fo"%OUT%\obj\\" "%SRC%\main.cpp" "%SRC%\display.cpp" "%SRC%\window.cpp" "%SRC%\wic.cpp" "%SRC%\runner.cpp" "%SRC%\combat.cpp" "%SRC%\tray.cpp" "%SRC%\store.cpp" "%SRC%\emote.cpp" "%SRC%\charconf.cpp" "%SRC%\xml.cpp" /link /SUBSYSTEM:WINDOWS /OUT:"%EXE%" user32.lib gdi32.lib shell32.lib windowscodecs.lib ole32.lib oleaut32.lib
 if errorlevel 1 goto fail
 
 if exist "resource\falcom.ico" copy /y "resource\falcom.ico" "%OUT%\bin\falcom.ico" >nul
@@ -60,7 +62,15 @@ if not exist "%OUT%\bin\Enemy" (
     mklink /J "%OUT%\bin\Enemy" "%ENEMYSRC%" >nul
   )
 )
+rem Alternate output directories reuse the split resources beside the main build.
+for %%c in (Enemy1 Enemy2) do if not exist "%OUT%\bin\%%c" if exist "%~dp0build\bin\%%c" mklink /J "%OUT%\bin\%%c" "%~dp0build\bin\%%c" >nul
 echo [OK] %EXE%
+if /i "%1"=="test" (
+  cl /nologo /std:c++17 /EHsc /utf-8 /W3 /DUNICODE /D_UNICODE /O2 /MT /DNDEBUG /Fo"%OUT%\obj\regression.obj" tests\regression.cpp "%OUT%\obj\display.obj" "%OUT%\obj\runner.obj" "%OUT%\obj\combat.obj" "%OUT%\obj\window.obj" "%OUT%\obj\wic.obj" "%OUT%\obj\emote.obj" "%OUT%\obj\charconf.obj" "%OUT%\obj\xml.obj" "%OUT%\obj\store.obj" /link /SUBSYSTEM:CONSOLE /OUT:"%OUT%\bin\regression.exe" user32.lib gdi32.lib shell32.lib windowscodecs.lib ole32.lib oleaut32.lib psapi.lib
+  if errorlevel 1 goto fail
+  "%OUT%\bin\regression.exe" "%~dp0testdata\ChrBig"
+  if errorlevel 1 goto fail
+)
 endlocal
 exit /b 0
 

@@ -1,4 +1,5 @@
 #include "runner.h"
+#include "store.h"
 
 #include <algorithm>
 #include <cmath>
@@ -39,6 +40,18 @@ bool Runner::Create(LayeredWindow* win, const Options& opt) {
     _opt = opt;
     // 配置从缓存里现取，这里只留目录名。见 runner.h 上 Cfg() 那条注释
     _cfgDir = opt.skinDir;
+    static uint64_t nextEntity = 0;
+    _entityId = ++nextEntity;
+    _faction = opt.faction == Faction::Unset ? DirectoryFaction(opt.skinDir) : opt.faction;
+    _hp = StartingHp(_faction);
+    for (int a = 0; a < ART_COUNT; ++a) {
+        for (int dir = 0; dir < DIR_COUNT; ++dir) {
+            std::error_code ec;
+            _available[a][dir] = std::filesystem::is_regular_file(
+                std::filesystem::path(opt.skinDir) / FolderOf((Art)a) / (L"dir" + std::to_wstring(dir) + L".png"), ec);
+        }
+    }
+
     _k = opt.k;
     _dpi = opt.dpi;
     _ox = opt.ox;
@@ -125,6 +138,12 @@ void Runner::Tick(double dt, Vec2 mouse) {
                 }
             }
         }
+    }
+
+    if (TickBattle(dt)) {
+        UpdateFrame(dt);
+        _bubble.Tick(dt, _pos, HeadTop(), _k, FaceLeft());
+        return;
     }
 
     // ---- 任务栏漫步 ----
@@ -372,7 +391,8 @@ void Runner::UpdateChase(double dt) {
 // 装备武器只换动作集和腿速，不动状态机：走/跑那套迟滞照旧在跑。
 // 缺武器图的人这里直接吞掉 —— 托盘那个勾是全局的，不能因为一个人没图
 // 就整条命令报错，或者让他黑一块
-void Runner::SetArmed(bool flag) {
+void Runner::SetArmed(bool flag, bool automatic) {
+    if (!automatic && flag != _armed) { _manualWeaponHold = 6.0; _autoArmed = false; }
     if (flag && !_opt.hasWeaponArt) flag = false;
     if (_armed == flag) return;
     _armed = flag;
@@ -448,10 +468,10 @@ void Runner::UpdateEncounter(double dt) {
     double bestLen = 1e300;
 
     for (const Runner* o : *s_peers) {
-        if (!o || o == this) continue;
+        if (!o || o == this || !Opposed(MyFaction(), o->MyFaction())) continue;
         // 敌人之间不许互相追打：那是"理"的一支，得在这儿挡掉，
         // 别挪到挨打那一路里去判 —— 那边只管"这一下怎么挨"
-        if (IsHostile(Id()) && IsHostile(o->Id())) continue;
+        if (!Opposed(MyFaction(), o->MyFaction())) continue;
         const Vec2 p = o->BodyCenter();
         const double len = std::sqrt((p.x - me.x) * (p.x - me.x) +
                                      (p.y - me.y) * (p.y - me.y)) / bl;
@@ -504,25 +524,62 @@ void Runner::UpdateWander(double dt) {
 // 这根线归 main 定：它才知道屏幕多大、任务栏在哪儿。Runner 只管沿着它走，
 // 所以这里一个字都不碰 _ox/_worldW 那套可行走区 —— 那是给满屏乱逛用的，
 // 拿它来夹这根线会把人夹到任务栏底下去
+void Runner::SetDisplay(const RECT& work, double dpiScale) {
+    if (_ox == work.left && _oy == work.top &&
+        _worldW == work.right - work.left && _worldH == work.bottom - work.top &&
+        _dpi == dpiScale) return;
+    const double scale = _dpi > 0 ? _k / _dpi : _opt.k;
+    _dpi = _opt.dpi = dpiScale;
+    _k = _opt.k = scale * dpiScale;
+    _ox = _opt.ox = work.left; _oy = _opt.oy = work.top;
+    _worldW = _opt.worldW = work.right - work.left;
+    _worldH = _opt.worldH = work.bottom - work.top;
+    _bounceCool = _dirLock = 0.0;
+    _lockEdge = 0;
+    if (!_opt.taskbar) ClampPos();
+    _needUpload = true;
+    _bubble.Tick(0.0, _pos, HeadTop(), _k, FaceLeft());
+}
+
 void Runner::SetTaskbar(bool on, double footY, double loX, double hiX) {
     if (_opt.taskbar == on && _tbFootY == footY && _tbLoX == loX && _tbHiX == hiX) return;
+    const bool wasOn = _opt.taskbar;
     _opt.taskbar = on;
     _tbFootY = footY;
     _tbLoX = loX;
     _tbHiX = hiX;
+    _stateLocked = on || _opt.forceState >= 0;
+    if (_battleActive || IsEnemy() || Entering() || Downed()) {
+        if (on) { _pos.x = (std::clamp)(_pos.x, loX, hiX); _pos.y = footY; }
+        else ClampPos();
+        if (Entering()) { _enterLeft = 0; EnterFromEdge(_dir == 4 ? 0 : 1); }
+        _needUpload = true;
+        return;
+    }
     // 关掉这一档得把之前钉的东西全数还回去：状态锁还锁着的话，这人会一辈子
     // 站在原地不动 —— 那是这一档自己设的，不是状态机设的
     if (!on) {
-        _stateLocked = false;
-        _state = State::Walk;
-        _returnTo = State::Walk;
+        if (!wasOn) return;
+        _stateLocked = _opt.forceState >= 0;
+        _state = _stateLocked ? (State)_opt.forceState : State::Walk;
+        _returnTo = _state;
         _artSet = false;
         _tbPhase = 0;
         _animClock = 0.0;
         _frameIndex = -1;
         LoadFrames();
+        ClampPos();
+        _needUpload = true;
+        _stats.state = (int)_state;
+        _bubble.Tick(0.0, _pos, HeadTop(), _k, FaceLeft());
         return;
     }
+    _pos.x = (std::clamp)(_pos.x, loX, hiX);
+    _pos.y = footY;
+    _needUpload = true;
+    _bubble.Tick(0.0, _pos, HeadTop(), _k, FaceLeft());
+    // A work-area/DPI change only moves the ledge; it must not restart a pose.
+    if (wasOn) return;
     // 起场先走一段，别一上来就杵在那儿不动
     _tbPhase = 0;
     _tbFacing = 1;
@@ -530,6 +587,7 @@ void Runner::SetTaskbar(bool on, double footY, double loX, double hiX) {
     _tbEmote = 3.0;
     _pos.y = footY;
     _state = State::Walk;
+    _stats.state = (int)_state;
     _stateLocked = true;   // 这一档不许转移表插嘴
     _dirReason = "taskbar";
     SetDirection(_tbFacing > 0 ? 4 : 0);
@@ -542,17 +600,16 @@ void Runner::SetTaskbar(bool on, double footY, double loX, double hiX) {
 // 不存在的文件，然后整个人黑一块
 bool Runner::HasArt(Art a) const {
     std::error_code ec;
-    const std::wstring p = _opt.skinDir + L"\\" + FolderOf(a) + L"\\dir0.png";
-    return std::filesystem::exists(p, ec);
+    return ActionOn(Cfg(), a) && std::filesystem::is_regular_file(StripPath(a, _dir), ec);
 }
 
 void Runner::BeginTaskbarPose() {
-    // 胜利优先，没有就退到出拳。两套都没有就别摆，站着就好
+    // Quiet companion mode: use a victory gesture when available.
     Art pick = Art::Victory;
-    if (!HasArt(Art::Victory)) pick = Art::Attack;
     if (!HasArt(pick)) {
         _tbPhase = 0;
         _tbTimer = 5.0;
+        _animClock = 0.0;
         return;
     }
     _tbPoseArt = pick;
@@ -561,11 +618,18 @@ void Runner::BeginTaskbarPose() {
     _animClock = 0.0;
     _frameIndex = -1;
     LoadFrames();
+    _tbTimer = (std::max)(_tbTimer, _frameCount / TB_VICTORY_FPS);
 }
 
 void Runner::UpdateTaskbar(double dt) {
-    if (_tbHiX <= _tbLoX) _tbHiX = _tbLoX + 1.0;
     _pos.y = _tbFootY;
+    _pos.x = (std::clamp)(_pos.x, _tbLoX, _tbHiX);
+    // Oversized skins cannot traverse a negative-width ledge.
+    if (_tbHiX <= _tbLoX) {
+        _tbPhase = 1;
+        _tbTimer = TB_TURN_PAUSE_SEC;
+        return;
+    }
 
     if (_tbEmote > 0) _tbEmote -= dt;
     // 冒脸：空档到了才冒，而且不许上一枚还挂着就再盖一张
@@ -615,6 +679,7 @@ void Runner::UpdateTaskbar(double dt) {
         } else {
             _tbPhase = 0;
             _tbTimer = walkDur(_rng);
+            _animClock = 0.0;
         }
         break;
     }
@@ -694,7 +759,7 @@ void Runner::Move(double dt) {
 void Runner::UpdateFrame(double dt) {
     if (_frameCount < 1) return;
     // 站住了就别让腿还在转，看着像踩在原地不动的跑步机上
-    if (_hold) return;
+    if (_hold && !_battleActive) return;
     // --frame=N 钉死：动画时钟继续走，但帧号不许变，省得截图的时候还在漂
     if (_opt.forceFrame >= 0 && _opt.forceFrame < _frameCount) {
         _animClock = 0.0;
@@ -704,7 +769,16 @@ void Runner::UpdateFrame(double dt) {
         }
         return;
     }
-    _animClock += dt;
+    if (_battleActive) {
+        _animClock += dt;
+        const auto art = ArtOf();
+        const double fps = art == Art::Kneel2 && Downed()
+            ? _frameCount / 2.0 : AnimationRate(art);
+        const int step = (int)std::floor(_animClock * fps);
+        const int frame = _battleOnce ? (std::min)(step, _frameCount - 1) : step % _frameCount;
+        if (frame != _frameIndex) { _frameIndex = frame; _needUpload = true; }
+        return;
+    }
     // 帧率按动作集取，不是按走/跑：武器跑比无武器跑慢一档，照搬那两个数
     // 会让剑影糊成一团。配置里写的 walkFrame/runFrame 只顶走和跑这两档 ——
     // 武器那两套的节拍是另一张表，没在 xml 里开过口子，别拿它去盖
@@ -719,22 +793,27 @@ void Runner::UpdateFrame(double dt) {
             return;
         }
         _animClock += dt;
-        const double poseFps = (ArtOf() == Art::Attack) ? TB_ATTACK_FPS : TB_VICTORY_FPS;
-        const int idx = (int)std::fmod(std::floor(_animClock * poseFps), (double)_frameCount);
+        const double rate = _tbPhase == 2 ? TB_VICTORY_FPS : TB_WALK_FPS;
+        const int step = (int)std::floor(_animClock * rate);
+        // Poses play once and hold, walking loops.
+        const int idx = _tbPhase == 2 ? (std::min)(step, _frameCount - 1) : step % _frameCount;
         if (idx != _frameIndex) {
             _frameIndex = idx;
             _needUpload = true;
         }
         return;
     }
-    double rate = walkFps;
+    _animClock += dt;
+    double rate = AnimationRate(ArtOf());
     switch (ArtOf()) {
         case Art::Run:     rate = runFps;      break;
         case Art::Standby: rate = STANDBY_FPS; break;
         case Art::Run2:    rate = RUN2_FPS;    break;
         case Art::Walk:    rate = walkFps;     break;
     }
-    const int idx = (int)std::fmod(std::floor(_animClock * rate), (double)_frameCount);
+    const bool once = _state == State::Attack || _state == State::BeAttacked || _state == State::Stun || _state == State::Victory;
+    const int step = (int)std::floor(_animClock * rate);
+    const int idx = once ? (std::min)(step, _frameCount - 1) : step % _frameCount;
     if (idx != _frameIndex) {
         _frameIndex = idx;
         _needUpload = true;
@@ -865,7 +944,7 @@ void Runner::SeparateAll() {
 
 // a 和 b 之间那一下，动作只从 a 这边发起一次，免得同一对事在两边各推一遍
 void Runner::SeparateFrom(Runner* other) {
-    if (!other) return;
+    if (!other || !Targetable() || !other->Targetable() || (_opt.taskbar && other->_opt.taskbar)) return;
     const Vec2 ca = BodyCenter();
     const Vec2 cb = other->BodyCenter();
     const double dx = cb.x - ca.x;
@@ -902,41 +981,37 @@ void Runner::SeparateFrom(Runner* other) {
 // 往后退几个身长、换哪张脸。撞上墙那一推**不看这张表**，还是 wall knock
 // 那个数 —— 不然一定有人往 <react> 里加一行想调撞墙
 void Runner::Hit(Runner* attacker) {
-    if (_hitCool > 0) return;
-    _hitCool = HIT_COOL_SEC;
+    if (!attacker || !Targetable() || !attacker->Targetable() || !Opposed(_faction, attacker->_faction)) return;
+    --_hp;
     ++_stats.hits;
-
-    const CharacterConfig& c = Cfg();
-    const std::wstring who = attacker ? attacker->Name() : std::wstring();
-    const int whoId = attacker ? attacker->Id() : 0;
-    const Reaction* r = MatchReaction(c, who, whoId);
-    const ReactKind kind = r ? r->kind : ReactKind::Normal;
-
-    // 退多远：表里写了就按表的。-1 才是"不置一声"，别拿 0 当这个意思 ——
-    // 0 的意思真的是"一步都不退"
-    const double kb = (r && r->kbLen >= 0.0) ? r->kbLen : HIT_KB_LEN;
-    const double bl = BodyLen();
-
-    // 方向是"离开打我的那个人"。查不到是谁就朝自己现在朝向的反面退
-    double ux = 0.0, uy = 0.0;
-    if (attacker) {
-        const Vec2 me = BodyCenter();
-        const Vec2 p = attacker->BodyCenter();
-        ux = me.x - p.x;
-        uy = me.y - p.y;
-        const double n = std::hypot(ux, uy);
-        if (n > 1e-9) { ux /= n; uy /= n; } else { ux = 1.0; uy = 0.0; }
+    _targetId = 0;
+    if (_hp <= 0) {
+        _hp = 0; _lifeAge = 0; _knockLeft = 0; _actionLeft = 0;
+        HideEmote();
+        BattleArt(Art::Kneel2, true, true);
+        _state = _faction == Faction::Ally ? State::Stun : State::Dead;
     } else {
-        ux = -DirDX()[_dir];
-        uy = -DirDY()[_dir];
+        const auto* reaction = MatchReaction(Cfg(), attacker->Name(), attacker->Id());
+        if (reaction && reaction->kind == ReactKind::None) return;
+        const bool wasHit = _battleActive && _battleArt == Art::BeAttacked && _actionLeft > 0;
+        const auto me = BodyCenter(), from = attacker->BodyCenter();
+        const double dx = me.x - from.x, dy = _opt.taskbar ? 0 : me.y - from.y;
+        const double norm = std::hypot(dx, dy);
+        const int facing = DirToward(-dx, -dy);
+        if (!wasHit || facing != _dir) {
+            _knockUnit = norm > 0.01 ? Vec2{dx / norm, dy / norm} : Vec2{1, 0};
+            _knockLeft = (reaction && reaction->kbLen >= 0 ? reaction->kbLen : 1.0) * BodyLen();
+        }
+        SetDirection(facing);
+        _lastHitter = attacker->EntityId();
+        _actionLeft = IsEnemy() ? 2.0 : 0.35;
+        const bool stunned = reaction && reaction->kind == ReactKind::Stun;
+        BattleArt(stunned ? Art::Kneel2 : Art::BeAttacked, true, !wasHit);
+        _state = stunned ? State::Stun : State::BeAttacked;
+        if (reaction && !reaction->emote.empty()) ShowEmote(reaction->emote.front());
+        else NotifyEmote(GameEvent::AttackedBy, attacker->Id());
     }
-    Shove(ux * kb * bl, uy * kb * bl);
-
-    // none = 挺住，什么都不演。剩下三种都往事件那一层走：表情和换态
-    // 都由表去管，这里再自己 ShowEmote 一遍就成了两处说法
-    if (kind == ReactKind::None) return;
-    if (kind == ReactKind::Stun) { Emit(GameEvent::StunBegin, whoId); return; }
-    Emit(GameEvent::AttackedBy, whoId);
+    _stats.state = (int)_state;
 }
 
 // 挤开之后报一次脸。两边各自有冷却，谁冷却完了谁说，都还冷却着就闭嘴
@@ -1516,9 +1591,19 @@ void Runner::Present() {
     const double offY = (double)b.y - FeetPx();
     const int x = (int)std::lround(_pos.x + offX * _k);
     const int y = (int)std::lround(_pos.y + offY * _k);
+    if (Entering() || _entryClip) {
+        if (Entering()) {
+            const int l = (std::clamp)((int)std::ceil(_ox - x), 0, winW);
+            const int t = (std::clamp)((int)std::ceil(_oy - y), 0, winH);
+            const int r = (std::clamp)((int)std::floor(_ox + _worldW - x), l, winW);
+            const int btm = (std::clamp)((int)std::floor(_oy + _worldH - y), t, winH);
+            SetWindowRgn(_win->Handle(), CreateRectRgn(l, t, r, btm), FALSE);
+        } else SetWindowRgn(_win->Handle(), nullptr, FALSE);
+        _entryClip = Entering();
+    }
     const bool moved = (x != _lastX || y != _lastY);
 
-    if (_opt.uploadEveryTick) _needUpload = true;
+    if (_opt.uploadEveryTick && moved) _needUpload = true;
     if (_needUpload) {
         // 只有换帧才上传这一整张表面，顺带把位置也定了
         const uint64_t t0 = NowUs();
@@ -1572,6 +1657,7 @@ void Runner::Present() {
 // ---- 表情 ----
 
 bool Runner::ShowEmote(int id, double seconds) {
+    if (IsEnemy() || Downed()) return false;
     if (!_bubble.Create()) return false;
     if (!_bubble.Show(id, seconds)) return false;
     _lastEmoteId = id;

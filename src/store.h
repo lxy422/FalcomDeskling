@@ -2,17 +2,18 @@
 
 #include <string>
 #include <vector>
+#include "faction.h"
 
 namespace fd {
 
 // 一个能上场的人：名字就是她那个夹的名字，路径是绝对路径。
-// id 是从她那份 character.xml 里读出来的"这是一类的谁"，同类可以共用一个号 ——
-// 那张表还没做，这里先留 0。
+// id is a material/configuration id; faction comes from the resource root.
 struct SkinInfo {
     std::wstring name;
     std::wstring dir;
     bool hasStandby = false;   // false = 武器那两套不齐，托盘里要标出来
     int  id = 0;
+    Faction faction = Faction::Ally;
 };
 
 // ---- 资源住在哪儿 ----
@@ -25,6 +26,9 @@ struct SkinInfo {
 // 看起来像"这个人缺图"，白查半天。找不到就照实说，并且说清楚看了哪个路径。
 const std::wstring& ChrRoot();
 const std::wstring& EnemyRoot();
+const std::wstring& EnemyRootFor(Faction faction);
+Faction DirectoryFaction(const std::wstring& dir);
+bool ValidateEnemySkin(const SkinInfo& skin, std::wstring& error);
 
 // 不管找没找到，程序打算去哪儿看 —— 报错的时候得靠它说实话
 const std::wstring& ChrRootGuess();
@@ -38,7 +42,7 @@ bool HasWalkSet(const std::wstring& dir);
 
 // 排过序的一遍名单：菜单和"随机定主角"都从这儿拿，顺序定下来才不会
 // 每次启动菜单换个样子
-std::vector<SkinInfo> ScanChr();
+std::vector<SkinInfo> ScanChr(std::wstring* diagnostic = nullptr);
 
 // 敌人索引。**只枚举目录名，一张图都不解** —— 那边真算下来是 207MB、6000 张，
 // 启动就全扫一遍等于把冷启动从 0.3 秒拖到 3 秒。齐不齐留到真要点名加的时候再验

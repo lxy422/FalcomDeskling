@@ -136,6 +136,20 @@ void Tray::Popup() {
     }
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)del, L"移除");
 
+    HMENU enemies = CreatePopupMenu();
+    AppendMenuW(enemies, MF_STRING, 400, L"随机加入一只");
+    AppendMenuW(enemies, MF_STRING, 401, L"加入 Enemy1（10 HP）");
+    AppendMenuW(enemies, MF_STRING, 402, L"加入 Enemy2（5 HP）");
+    AppendMenuW(enemies, MF_STRING | ((enemyAuto && enemyAuto()) ? MF_CHECKED : 0), 403, L"自动增加");
+    HMENU interval = CreatePopupMenu();
+    const int seconds[] = {1, 5, 10, 20, 30, 60, 120};
+    for (int i = 0; i < 7; ++i) {
+        const auto title = std::to_wstring(seconds[i]) + L" 秒";
+        AppendMenuW(interval, MF_STRING | ((enemyInterval && enemyInterval() == seconds[i]) ? MF_CHECKED : 0), 410 + i, title.c_str());
+    }
+    AppendMenuW(enemies, MF_POPUP, (UINT_PTR)interval, L"生成间隔");
+    AppendMenuW(enemies, MF_STRING, 404, L"清空所有敌人");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)enemies, L"敌人");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_QUIT, L"退出");
 
@@ -153,6 +167,10 @@ void Tray::Popup() {
     DestroyMenu(emo);
     DestroyMenu(menu);
     if (cmd == 0) return;
+    if (cmd >= 400 && cmd <= 402) { if (onEnemyAdd) onEnemyAdd(cmd - 400); return; }
+    if (cmd == 403) { if (onEnemyAuto) onEnemyAuto(!(enemyAuto && enemyAuto())); return; }
+    if (cmd == 404) { if (onEnemyClear) onEnemyClear(); return; }
+    if (cmd >= 410 && cmd <= 416) { if (onEnemyInterval) onEnemyInterval(seconds[cmd - 410]); return; }
 
     switch (cmd) {
     case IDM_TOGGLE:

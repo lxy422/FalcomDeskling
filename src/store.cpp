@@ -1,4 +1,7 @@
 #include "store.h"
+#include "wic.h"
+#include "config.h"
+#include <cwctype>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -40,6 +43,7 @@ struct Root {
 
 Root g_chr;
 Root g_enemy;
+Root g_enemy1, g_enemy2;
 std::wstring g_chrOverride;
 std::wstring g_enemyOverride;
 
@@ -79,6 +83,7 @@ void SetRootOverrides(const std::wstring& chr, const std::wstring& enemy) {
     // 改了就得重新找一遍，别让先前的猜测把后面的显式路径吃掉
     g_chr = Root{};
     g_enemy = Root{};
+    g_enemy1 = Root{}; g_enemy2 = Root{};
 }
 
 const std::wstring& ChrRoot() { return Resolve(g_chr, L"chr", g_chrOverride); }
@@ -94,28 +99,53 @@ bool HasWalkSet(const std::wstring& dir) {
     return fs::is_regular_file(fs::path(dir) / L"2.Walk" / L"dir0.png", ec);
 }
 
-std::vector<SkinInfo> ScanChr() {
+std::vector<SkinInfo> ScanChr(std::wstring* diagnostic) {
     std::vector<SkinInfo> found;
+    if (diagnostic) diagnostic->clear();
     const std::wstring& root = ChrRoot();
     if (root.empty()) return found;
 
     std::error_code ec;
+    size_t directories = 0;
+    std::wstring skipped;
     for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
         std::error_code e2;
         if (!it->is_directory(e2)) continue;
+        ++directories;
         const fs::path p = it->path();
         const std::wstring leaf = p.filename().wstring();
         // 这几个不是人：敌人那摊、资源、还有联接自己套上来的同名夹
         if (leaf == L"Enemy" || leaf == L"Resource" || leaf == L"Chr") continue;
-        if (!HasWalkSet(p.wstring())) continue;
+        if (!HasWalkSet(p.wstring())) {
+            if (directories <= 3) {
+                std::error_code walkError;
+                const auto walk = p / L"2.Walk" / L"dir0.png";
+                (void)fs::is_regular_file(walk, walkError);
+                skipped += L"\n  " + walk.wstring();
+                if (walkError) skipped += L"（系统错误 " + std::to_wstring(walkError.value()) + L"）";
+            }
+            continue;
+        }
 
         SkinInfo si;
         si.name = leaf;
         si.dir = p.wstring();
         // 武器那两套都得齐才算数：少一套的话装备态会去开一个不存在的文件
-        si.hasStandby = fs::is_regular_file(p / L"4.standby" / L"dir0.png", ec) &&
-                        fs::is_regular_file(p / L"5.run2" / L"dir0.png", ec);
+        // Optional art must not change the directory iterator's error state.
+        std::error_code artError;
+        si.hasStandby = fs::is_regular_file(p / L"4.standby" / L"dir0.png", artError) &&
+                        fs::is_regular_file(p / L"5.run2" / L"dir0.png", artError);
         found.push_back(si);
+    }
+    if (diagnostic) {
+        *diagnostic = L"已枚举人物子目录：" + std::to_wstring(directories) +
+                      L"；可用角色：" + std::to_wstring(found.size());
+        if (ec) *diagnostic += L"\n目录枚举失败，系统错误：" + std::to_wstring(ec.value());
+        if (found.empty()) {
+            *diagnostic += L"\n需要的结构：chr\\角色名\\2.Walk\\dir0.png";
+            if (HasWalkSet(root)) *diagnostic += L"\n当前 --root 指到了角色目录，请改为它的上一级。";
+            if (!skipped.empty()) *diagnostic += L"\n未找到的文件（最多列出 3 个）：" + skipped;
+        }
     }
     std::sort(found.begin(), found.end(),
               [](const SkinInfo& a, const SkinInfo& b) { return a.name < b.name; });
@@ -128,42 +158,77 @@ std::vector<SkinInfo> ScanChr() {
     return found;
 }
 
+
+const std::wstring& EnemyRootFor(Faction faction) {
+    const auto leaf = faction == Faction::Enemy1 ? L"Enemy1" : L"Enemy2";
+    return Resolve(faction == Faction::Enemy1 ? g_enemy1 : g_enemy2, leaf,
+                   g_enemyOverride.empty() ? L"" : (fs::path(g_enemyOverride) / leaf).wstring());
+}
+
+namespace {
+bool Under(const std::wstring& dir, const std::wstring& root) {
+    if (root.empty()) return false;
+    std::error_code ec;
+    auto a = fs::weakly_canonical(dir, ec).wstring();
+    if (ec) return false;
+    auto b = fs::weakly_canonical(root, ec).wstring();
+    return !ec && a.size() > b.size() && _wcsnicmp(a.c_str(), b.c_str(), b.size()) == 0 &&
+        (a[b.size()] == L'\\' || a[b.size()] == L'/');
+}
+int NumberOf(const std::wstring& name) {
+    auto start = name.find_last_not_of(L"0123456789");
+    if (start == name.size() - 1) return -1;
+    try { return std::stoi(name.substr(start == std::wstring::npos ? 0 : start + 1)); }
+    catch (...) { return -1; }
+}
+}
+Faction DirectoryFaction(const std::wstring& dir) {
+    if (Under(dir, EnemyRootFor(Faction::Enemy1))) return Faction::Enemy1;
+    if (Under(dir, EnemyRootFor(Faction::Enemy2))) return Faction::Enemy2;
+    // Read-only compatibility for a legacy Enemy tree, until split by the tool.
+    std::error_code ec;
+    const int number = NumberOf(fs::path(dir).filename().wstring());
+    if (number >= 0 && !EnemyRoot().empty() && fs::equivalent(fs::path(dir).parent_path(), EnemyRoot(), ec))
+        return number < 10000 ? Faction::Enemy1 : Faction::Enemy2;
+    return Faction::Ally;
+}
+
 std::vector<SkinInfo> ScanEnemyIndex() {
     std::vector<SkinInfo> found;
-    const std::wstring& root = EnemyRoot();
-    if (root.empty()) return found;
-
-    // 这里一个像素都不解：齐不齐留到真要点名加的那一下再验
-    std::error_code ec;
-    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
-        std::error_code e2;
-        if (!it->is_directory(e2)) continue;
-        const fs::path p = it->path();
-        if (!LooksLikeSkinRoot(p)) continue;
-
-        SkinInfo si;
-        si.name = p.filename().wstring();
-        si.dir = p.wstring();
-        si.hasStandby = fs::is_regular_file(p / L"4.standby" / L"dir0.png", ec) &&
-                        fs::is_regular_file(p / L"5.run2" / L"dir0.png", ec);
-        found.push_back(si);
+    for (auto faction : {Faction::Enemy1, Faction::Enemy2}) {
+        auto root = EnemyRootFor(faction);
+        const bool split = !root.empty();
+        if (!split) root = EnemyRoot();
+        if (root.empty()) continue;
+        std::error_code ec;
+        for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code e2;
+            if (!it->is_directory(e2) || !LooksLikeSkinRoot(it->path())) continue;
+            const auto name = it->path().filename().wstring();
+            const int number = NumberOf(name);
+            if (number < 0 || (number < 10000 ? Faction::Enemy1 : Faction::Enemy2) != faction) continue;
+            SkinInfo skin;
+            skin.name = name; skin.dir = it->path().wstring(); skin.id = number;
+            skin.faction = faction; skin.hasStandby = true;
+            found.push_back(skin);
+        }
     }
-    std::sort(found.begin(), found.end(),
-              [](const SkinInfo& a, const SkinInfo& b) { return a.name < b.name; });
+    std::sort(found.begin(), found.end(), [](const SkinInfo& a, const SkinInfo& b) { return a.name < b.name; });
     return found;
 }
 
-bool IsEnemyDir(const std::wstring& dir) {
-    if (dir.empty()) return false;
-    const std::wstring& root = EnemyRoot();
-    if (root.empty()) return false;
-    std::error_code ec;
-    fs::path a = fs::weakly_canonical(dir, ec);
-    fs::path b = fs::weakly_canonical(root, ec);
-    if (ec) return false;
-    const std::wstring sa = a.wstring(), sb = b.wstring();
-    if (sa.size() <= sb.size() || sa.compare(0, sb.size(), sb) != 0) return false;
-    return sa[sb.size()] == L'\\' || sa[sb.size()] == L'/';
+bool ValidateEnemySkin(const SkinInfo& skin, std::wstring& error) {
+    for (auto art : {Art::Standby, Art::Run2, Art::Attack, Art::BeAttacked, Art::Kneel2}) {
+        for (int dir = 0; dir < DIR_COUNT; ++dir) {
+            const auto path = fs::path(skin.dir) / FolderOf(art) / (L"dir" + std::to_wstring(dir) + L".png");
+            Strip strip;
+            if (!DecodePngStrip(path.c_str(), strip) || strip.frames < 1 || strip.width % strip.height != 0) {
+                error = L"敌人素材缺失或损坏：" + path.wstring(); return false;
+            }
+        }
+    }
+    error.clear(); return true;
 }
+bool IsEnemyDir(const std::wstring& dir) { return EnemyFaction(DirectoryFaction(dir)); }
 
-}  // namespace fd
+} // namespace fd
