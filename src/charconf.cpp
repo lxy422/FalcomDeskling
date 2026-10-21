@@ -394,8 +394,15 @@ void ApplyCharacterXml(const XmlElem& root, CharacterConfig& c) {
         }
     }
     if (const XmlElem* en = root.Kid(L"enemy")) {
-        int hp = 0;
-        if (GetInt(*en, L"hp", hp)) { c.hp.Assign(hp); ++c.fields; }
+        if (en->Has(L"hp")) {
+            const auto& text = *en->Attr(L"hp");
+            wchar_t* end = nullptr;
+            const double hp = wcstod(text.c_str(), &end);
+            while (end && (*end == L' ' || *end == L'\t' || *end == L'\r' || *end == L'\n')) ++end;
+            if (end != text.c_str() && end && !*end && std::isfinite(hp) && hp >= 1 && hp <= 1000000 && std::floor(hp) == hp) {
+                c.hp.Assign((int)hp); ++c.fields;
+            } else c.warnings.push_back(L"enemy hp 必须是 1 到 1000000 的整数，保留已有值或阵营默认值");
+        }
         for (const auto& kv : {std::pair{L"idleSec", &c.idleSec},
                                {L"disarmSec", &c.disarmSec}}) {
             if (double d; GetDouble(*en, kv.first, d)) { kv.second->Assign(d); ++c.fields; }
@@ -421,7 +428,6 @@ CharacterConfig SeedMonster() {
     CharacterConfig c;
     c.id = kMonsterDefaultId;
     c.faction = Faction::Monster;
-    c.hp.Assign(DEFAULT_HP);
     c.idleSec.Assign(IDLE_SEC);
     c.disarmSec.Assign(DISARM_SEC);
     c.fields = 0;
@@ -439,6 +445,7 @@ CharacterConfig SeedAlly() {
 // 读 EnemyRoot() 底下那份公共底。没有就交回一份纯默认
 CharacterConfig LoadMonsterBase(const std::wstring& dir) {
     CharacterConfig c = SeedMonster();
+    if (ConfigDisabled()) return c;
     const std::wstring root = EnemyRootFor(DirectoryFaction(dir));
     if (root.empty()) return c;
     std::error_code ec;
@@ -492,7 +499,8 @@ CharacterConfig LoadOne(const std::wstring& dir, int idHint) {
 
     // Runtime allegiance follows the resource root, never an incidental XML id.
     c.faction = DirectoryFaction(dir);
-    c.hp.Assign(StartingHp(c.faction));
+    // Enemy HP may be supplied by shared or per-skin XML; chr stays immortal at 10 HP.
+    if (!enemy) c.hp = Opt<int>{};
     if (enemy) c.id = idHint;
     if (c.emotePool.empty() && !c.emotePoolSet && !enemy) {
         for (int i = 1; i <= EMOTE_LAST_ID; ++i) c.emotePool.push_back(i);
@@ -876,9 +884,17 @@ std::wstring DumpConfig(const CharacterConfig& c, const std::wstring& dir) {
     AppendOpt(s, L"nearLen", c.nearLen, RUN_START_LEN, L"常量");
     AppendOpt(s, L"farLen", c.farLen, RUN_END_LEN, L"常量");
     AppendOpt(s, L"keepLen", c.keepLen, KEEP_LEN, L"常量");
+    AppendOpt(s, L"mouseMode", c.mouseMode, 0, L"常量 (0=flee, 1=follow, 2=off)");
+    AppendOpt(s, L"touchCoolSec", c.touchCoolSec, TOUCH_COOLDOWN_SEC, L"常量");
+    AppendOpt(s, L"allowRest", c.allowRest, true, L"常量");
+    AppendOpt(s, L"restAfterSec", c.restAfterSec, REST_AFTER_SEC, L"常量");
+    AppendOpt(s, L"restFarSec", c.restFarSec, REST_FAR_SEC, L"常量");
+    AppendOpt(s, L"restDurationSec", c.restDurationSec, REST_DURATION_SEC, L"常量");
+    AppendOpt(s, L"hp", c.hp, StartingHp(c.faction), L"阵营默认");
     AppendOpt(s, L"encNearLen", c.encNearLen, ENC_NEAR_LEN, L"常量");
     AppendOpt(s, L"encFarLen", c.encFarLen, ENC_FAR_LEN, L"常量");
     AppendOpt(s, L"attackLen", c.attackLen, ATTACK_LEN, L"常量");
+    AppendOpt(s, L"attackCoolSec", c.attackCoolSec, ATTACK_COOL_SEC, L"常量");
     AppendOpt(s, L"wanderSec", c.wanderSec, WANDER_SEC, L"常量");
     AppendOpt(s, L"emoteGapSec", c.emoteGapSec, EMOTE_GAP_SEC, L"常量");
     AppendOpt(s, L"emoteShowSec", c.emoteShowSec, EMOTE_SHOW_SEC, L"常量");

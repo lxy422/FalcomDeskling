@@ -1,4 +1,5 @@
 #include "window.h"
+#include "../resource/resource.h"
 
 #include <cstring>
 
@@ -68,6 +69,8 @@ bool LayeredWindow::Create(int w, int h, bool clickThrough, bool topmost) {
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = WndProc;
         wc.hInstance = inst;
+        wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(IDI_FALCOM));
+        wc.hIconSm = wc.hIcon;
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.hbrBackground = nullptr;
         wc.lpszClassName = kClass;

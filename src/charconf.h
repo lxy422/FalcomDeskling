@@ -228,7 +228,7 @@ struct CharacterConfig {
     // 尺寸：身长是所有距离的尺子
     Opt<double> bodyLen;
 
-    // 敌人那几项。血条这件事只长在敌人身上，所以我方那份文件里没有这一项
+    // 敌人的可配置 HP；未写时用阵营默认值，chr 始终为 10 HP。
     Opt<int> hp;
     Opt<double> idleSec;
     Opt<double> disarmSec;

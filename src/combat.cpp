@@ -101,6 +101,14 @@ void Runner::EnterFromEdge(int side) {
 bool Runner::TickBattle(double dt) {
     _battleCool = (std::max)(0.0, _battleCool - dt);
     _manualWeaponHold = (std::max)(0.0, _manualWeaponHold - dt);
+    // Knockback belongs to the hit, independently of hurt animations and HP.
+    // Process it even on a lethal hit or when react kind="none" is configured.
+    const bool knocked = _knockLeft > 0;
+    if (knocked) {
+        const double step = (std::min)(_knockLeft, BodyLen() * dt / 0.35);
+        BattleMove(_knockUnit.x * step, _knockUnit.y * step);
+        _knockLeft = (std::max)(0.0, _knockLeft - step);
+    }
     if (Downed()) {
         _lifeAge += dt;
         _targetId = 0;
@@ -125,13 +133,10 @@ bool Runner::TickBattle(double dt) {
     }
     if (_actionLeft > 0) {
         _actionLeft -= dt;
-        if (_knockLeft > 0) {
-            const double step = (std::min)(_knockLeft, BodyLen() * dt / 0.35);
-            BattleMove(_knockUnit.x * step, _knockUnit.y * step); _knockLeft -= step;
-        }
         if (_actionLeft > 0) return true;
-        _knockLeft = 0;
     }
+    // Do not cancel the last recoil step by chasing forward on the same tick.
+    if (knocked) return true;
     const auto* target = SelectTarget();
     if (!target) {
         _targetId = 0;
@@ -163,7 +168,11 @@ bool Runner::TickBattle(double dt) {
     SetDirection(DirToward(dx, dy));
     const double distance = BattleDistance(*target);
     const double reach = (std::max)(Cfg().attackLen.valueOr(ATTACK_LEN) * BodyLen(), HalfW() + target->HalfW() + PEER_PAD * _dpi + 2);
-    if (distance <= reach) {
+    // A chase can land a few floating-point ulps outside reach. The remaining
+    // step then rounds back to the same position forever. Treat subpixel
+    // contact as in range, at the same logical tolerance for every DPI.
+    const double contactTolerance = 0.5 * _dpi;
+    if (distance <= reach + contactTolerance) {
         _state = State::Idle;
         if (_battleCool <= 0) {
             _battleCool = (std::max)(0.05, Cfg().attackCoolSec.valueOr(ATTACK_COOL_SEC));

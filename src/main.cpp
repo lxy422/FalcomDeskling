@@ -1,4 +1,5 @@
 #include "config.h"
+#include "../resource/resource.h"
 #include "display.h"
 #include "enemy.h"
 #include <set>
@@ -619,6 +620,8 @@ bool CreateMsgWindow() {
         wc.lpfnWndProc = MsgWndProc;
         wc.hInstance = GetModuleHandle(nullptr);
         wc.lpszClassName = kClass;
+        wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(IDI_FALCOM));
+        wc.hIconSm = wc.hIcon;
         if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
             return false;
         }

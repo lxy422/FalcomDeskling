@@ -1,4 +1,5 @@
 #include "tray.h"
+#include "../resource/resource.h"
 #include "emote.h"   // EmoteTitle：表情子菜单那些名字只有这里一份
 
 #include <cstring>
@@ -23,12 +24,13 @@ bool Tray::Create(HWND hwnd, const wchar_t* iconPath, const wchar_t* tip) {
     wcsncpy_s(_nid.szTip, tip ? tip : L"FalcomDeskling", _TRUNCATE);
 
     const int side = GetSystemMetrics(SM_CXSMICON);
-    HICON ico = nullptr;
-    if (iconPath && *iconPath) {
+    HICON ico = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr),
+        MAKEINTRESOURCEW(IDI_FALCOM), IMAGE_ICON, side, side, 0));
+    if (!ico && iconPath && *iconPath) {
         ico = static_cast<HICON>(LoadImageW(nullptr, iconPath, IMAGE_ICON, side, side,
                                             LR_LOADFROMFILE));
     }
-    if (!ico) ico = LoadIcon(nullptr, IDI_APPLICATION);
+    if (!ico) ico = CopyIcon(LoadIcon(nullptr, IDI_APPLICATION));
     _nid.hIcon = ico;
 
     if (Shell_NotifyIconW(NIM_ADD, &_nid) == FALSE) {

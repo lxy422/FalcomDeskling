@@ -1,2 +1,23 @@
-build/
-dist/
+# Public source allowlist. Local tools, tests, assets and outputs stay on disk.
+/*
+!/.gitignore
+!/README.md
+!/build.cmd
+!/src/
+!/resource/
+!/docs/
+
+/src/*
+!/src/*.cpp
+!/src/*.h
+
+/resource/*
+!/resource/falcom.ico
+!/resource/falcom.rc
+!/resource/resource.h
+!/resource/emotio.png
+
+/docs/*
+!/docs/combat.md
+!/docs/emotes.md
+!/docs/emotes.html

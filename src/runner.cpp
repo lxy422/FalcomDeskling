@@ -43,7 +43,8 @@ bool Runner::Create(LayeredWindow* win, const Options& opt) {
     static uint64_t nextEntity = 0;
     _entityId = ++nextEntity;
     _faction = opt.faction == Faction::Unset ? DirectoryFaction(opt.skinDir) : opt.faction;
-    _hp = StartingHp(_faction);
+    _maxHp = IsEnemy() ? Cfg().hp.valueOr(StartingHp(_faction)) : StartingHp(_faction);
+    _hp = _maxHp;
     for (int a = 0; a < ART_COUNT; ++a) {
         for (int dir = 0; dir < DIR_COUNT; ++dir) {
             std::error_code ec;
@@ -141,6 +142,8 @@ void Runner::Tick(double dt, Vec2 mouse) {
     }
 
     if (TickBattle(dt)) {
+        _roamAge = _farAge = 0;
+        UpdateRandomEmote(dt);
         UpdateFrame(dt);
         _bubble.Tick(dt, _pos, HeadTop(), _k, FaceLeft());
         return;
@@ -153,6 +156,7 @@ void Runner::Tick(double dt, Vec2 mouse) {
     // 或者 SeparateAll 把两个人推开 —— 所以在这里一次分岔，底下全跳过
     if (_opt.taskbar) {
         UpdateTaskbar(dt);
+        UpdateRandomEmote(dt);
         UpdateFrame(dt);
         _bubble.Tick(dt, _pos, HeadTop(), _k, FaceLeft());
         return;
@@ -160,17 +164,17 @@ void Runner::Tick(double dt, Vec2 mouse) {
 
     // 时间到还不算，得真让开那条边才放锁；正往这条边回冲的时候也不许放
     if (_lockEdge != 0 && _dirLock <= 0 && ClearOfEdge(_lockEdge) &&
-        !TowardEdge(_dir, _lockEdge) && !TowardEdge(DirAwayFromMouse(mouse), _lockEdge)) {
+        !TowardEdge(_dir, _lockEdge) && (MouseMode() != 0 || !TowardEdge(DirAwayFromMouse(mouse), _lockEdge))) {
         _lockEdge = 0;
     }
 
     // MouseMode.Off：远近不许改变它的任何打算，这里一次定死，底下全读同一个说法
-    const double dist = _opt.wander ? std::numeric_limits<double>::infinity() : BodyDistance(mouse);
+    const double dist = MouseMode() == 2 ? std::numeric_limits<double>::infinity() : BodyDistance(mouse);
 
     // 规则 3：被鼠标蹭到，就往当前朝向的反方向 ±45 度弹开
-    if (_touchCool <= 0 && BodyHit(mouse)) {
+    if (MouseMode() == 0 && !_stateLocked && _touchCool <= 0 && BodyHit(mouse)) {
         FlickAway();
-        _touchCool = Cfg().touchCoolSec.valueOr(TOUCH_COOLDOWN_SEC);
+        _touchCool = (std::max)(0.0, Cfg().touchCoolSec.valueOr(TOUCH_COOLDOWN_SEC));
         Emit(GameEvent::Touched);
     }
 
@@ -178,8 +182,10 @@ void Runner::Tick(double dt, Vec2 mouse) {
     UpdateEncounter(dt);
     UpdateChase(dt);
     TickState(dt);
+    UpdateRest(dt, dist);
     UpdateFlee(dt);
     Move(dt);
+    UpdateRandomEmote(dt);
     UpdateFrame(dt);
 
     // 泡泡排在最后：它得跟着这一拍真的脚底和头顶走，早一拍就是上一拍的位置
@@ -204,7 +210,9 @@ void Runner::UpdateState(double dt, double dist) {
     const double runOut = Cfg().farLen.valueOr(RUN_END_LEN) * BodyLen();
     const State before = _state;
     if (_state == State::Walk) {
-        if (dist < runIn) SetState(State::Run);
+        if (MouseMode() == 1 ? dist > runOut : dist < runIn) SetState(State::Run);
+    } else if (MouseMode() == 1) {
+        if (dist < runIn) SetState(State::Walk);
     } else {
         if (dist > runOut && _runTravel >= runOut) SetState(State::Walk);
     }
@@ -223,6 +231,7 @@ void Runner::SetState(State st) { EnterState(st, false); }
 // 那是它自己的事，跟"挨一下之后回哪儿"无关
 void Runner::EnterState(State st, bool fromRule) {
     if (_state == st) return;
+    if (_state == State::Rest && st != State::Rest) _roamAge = _farAge = 0;
     if (fromRule) _returnTo = _state;
     _state = st;
     ++_stats.stateChanges;
@@ -257,7 +266,7 @@ double Runner::StateHold(State st) const {
     case State::Attack:     return ATTACK_SEC;
     case State::Victory:    return VICTORY_SEC;
     // 歇多久是配置里写的，不是这里定的
-    case State::Rest:       return c.restDurationSec.valueOr(REST_DURATION_SEC);
+    case State::Rest:       return (std::max)(0.05, c.restDurationSec.valueOr(REST_DURATION_SEC));
     // 倒下不自己起来，除非哪天配了复活
     case State::Dead:       return 1e300;
     // 走/跑/追没有"放完"这一说，只有最小停留时间
@@ -292,14 +301,16 @@ bool Runner::ApplyStateRule(GameEvent ev, int byId) {
     // 这两条早退都交回 false："态没换成，但事还是发生了"，表情那一半还得让
     // 事件映射表去管 —— 等级不够拦住的只是换态，不是这件事本身
     if (to == _state) return false;
-    if (InterruptRank(to) <= InterruptRank(_state) && _stateClock < StateHold(_state))
+    if (!(_state == State::Rest && ev == GameEvent::RestEnd) &&
+        InterruptRank(to) <= InterruptRank(_state) && _stateClock < StateHold(_state))
         return false;
 
-    if (r->art.set) { _artOverride = r->art.v; _artSet = true; }
-    else _artSet = false;
-
-    if (r->cooldownSec.set) _stateCool = r->cooldownSec.v;
-    else _stateCool = STATE_MIN_SEC;
+    // EnterState resets the old art. Apply the new rule's overrides afterwards.
+    EnterState(to, !r->back);
+    _artSet = r->art.set;
+    if (r->art.set) _artOverride = r->art.v;
+    _stateCool = r->cooldownSec.valueOr(STATE_MIN_SEC);
+    if (_artSet) { _animClock = 0; _frameIndex = -1; LoadFrames(); }
 
     // 追人得先知道追谁：UpdateChase 只认这个名字，认不出来就按"跟丢了"算
     if (to == State::Chase && byId > 0) {
@@ -316,12 +327,10 @@ bool Runner::ApplyStateRule(GameEvent ev, int byId) {
             std::uniform_int_distribution<int> pick(0, (int)r->emote.v.size() - 1);
             ShowEmote(r->emote.v[pick(_rng)], c.emoteShowSec.valueOr(EMOTE_SHOW_SEC));
         }
-        EnterState(to, !r->back);
         return true;   // 这里该不该安静，表说了算，别拿默认映射去补
     }
     // back=true 的那一行本来就是在"回到进态之前"，再写一次 _returnTo 只会把
     // 它换成刚放完那一态，下次回来就回错地方
-    EnterState(to, !r->back);
     return false;
 }
 
@@ -426,11 +435,89 @@ void Runner::FlickAway() {
 // Escape 一路只在 Run 态里转向，走路时一个字都不动。
 void Runner::UpdateFlee(double dt) {
     _hold = false;
-    if (_opt.wander) {
+    if (_state != State::Walk && _state != State::Run) return;
+    if (MouseMode() == 2) {
         UpdateWander(dt);
         return;
     }
+    if (MouseMode() == 1) { UpdateApproach(dt); return; }
     if (_state == State::Run) UpdateEscape(dt);
+}
+
+void Runner::UpdateApproach(double dt) {
+    if (IsNaN(_mouse)) { UpdateWander(dt); return; }
+    _hold = BodyDistance(_mouse) <= (std::max)(0.0, Cfg().keepLen.valueOr(KEEP_LEN)) * BodyLen();
+    if (_hold || _dirLock > 0) return;
+    _fleeClock += dt;
+    if (!_fleeForce && _fleeClock < FLEE_STEER_SEC) return;
+    _fleeClock = 0; _fleeForce = false;
+    const auto center = BodyCenter();
+    const double dx = _mouse.x - center.x, dy = _mouse.y - center.y;
+    const int ideal = DirToward(dx, dy);
+    int best = ideal;
+    double score = -1e300;
+    const double distance = std::hypot(dx, dy);
+    for (int d = 0; d < DIR_COUNT; ++d) {
+        double value = distance > 0 ? (DirDX()[d] * dx + DirDY()[d] * dy) / distance : 0;
+        if (IntoWall(d)) value -= 1000;
+        if (PeerAhead(d)) value -= PEER_PENALTY;
+        if (_lockEdge && TowardEdge(d, _lockEdge)) value -= 800;
+        if (d == ideal) value += 0.1;
+        if (value > score) { score = value; best = d; }
+    }
+    _dirReason = "approach";
+    SetDirection(best);
+}
+
+void Runner::UpdateRest(double dt, double distance) {
+    if (_stateLocked || IsEnemy()) return;
+    const auto& c = Cfg();
+    const bool allowed = c.allowRest.valueOr(true) && MouseMode() != 1;
+    if (_state == State::Rest) {
+        if (!allowed || distance < c.farLen.valueOr(RUN_END_LEN) * BodyLen()) {
+            Emit(GameEvent::RestEnd);
+            if (_state == State::Walk && MouseMode() == 0 && distance < c.nearLen.valueOr(RUN_START_LEN) * BodyLen())
+                SetState(State::Run);
+        }
+        return;
+    }
+    if (_state != State::Walk && _state != State::Run) { _farAge = 0; return; }
+    _roamAge += dt;
+    if (distance > c.farLen.valueOr(RUN_END_LEN) * BodyLen()) _farAge += dt;
+    else _farAge = 0;
+    if (allowed && _roamAge >= (std::max)(0.0, c.restAfterSec.valueOr(REST_AFTER_SEC)) &&
+        _farAge >= (std::max)(0.0, c.restFarSec.valueOr(REST_FAR_SEC))) Emit(GameEvent::RestBegin);
+}
+
+int Runner::PickRandomEmote(const std::vector<int>& pool) {
+    if (pool.empty()) return 0;
+    std::vector<int> candidates;
+    for (int id : pool) if (id != _lastRandomEmote) candidates.push_back(id);
+    const auto& available = candidates.empty() ? pool : candidates;
+    return available[std::uniform_int_distribution<size_t>(0, available.size() - 1)(_rng)];
+}
+
+void Runner::UpdateRandomEmote(double dt) {
+    if (IsEnemy() || Downed() || _state == State::Rest) { _randomEmoteAge = 0; return; }
+    const auto& c = Cfg();
+    if (_opt.taskbar) {
+        // Preserve the quiet taskbar defaults unless XML explicitly sets a pool/interval.
+        if (c.emoteGapSec.set && c.emoteGapSec.v <= 0) return;
+        _tbEmote -= dt;
+        if (_tbEmote > 0 || _bubble.Busy()) return;
+        static const std::vector<int> defaults{3, 4};
+        const int id = PickRandomEmote(c.emotePoolSet ? c.emotePool : defaults);
+        if (id > 0 && ShowEmote(id, c.emoteShowSec.valueOr(2.6))) _lastRandomEmote = id;
+        _tbEmote = c.emoteGapSec.set ? c.emoteGapSec.v :
+            std::uniform_real_distribution<double>(TB_EMOTE_MIN_SEC, TB_EMOTE_MAX_SEC)(_rng);
+        return;
+    }
+    const double gap = c.emoteGapSec.valueOr(EMOTE_GAP_SEC);
+    if (gap <= 0 || c.emotePool.empty()) return;
+    _randomEmoteAge += dt;
+    if (_randomEmoteAge < gap || _bubble.Busy()) return;
+    const int id = PickRandomEmote(c.emotePool);
+    if (id > 0 && ShowEmote(id, c.emoteShowSec.valueOr(EMOTE_SHOW_SEC))) _lastRandomEmote = id;
 }
 
 void Runner::UpdateEscape(double dt) {
@@ -584,7 +671,7 @@ void Runner::SetTaskbar(bool on, double footY, double loX, double hiX) {
     _tbPhase = 0;
     _tbFacing = 1;
     _tbTimer = 4.0;
-    _tbEmote = 3.0;
+    _tbEmote = Cfg().emoteGapSec.valueOr(3.0);
     _pos.y = footY;
     _state = State::Walk;
     _stats.state = (int)_state;
@@ -629,15 +716,6 @@ void Runner::UpdateTaskbar(double dt) {
         _tbPhase = 1;
         _tbTimer = TB_TURN_PAUSE_SEC;
         return;
-    }
-
-    if (_tbEmote > 0) _tbEmote -= dt;
-    // 冒脸：空档到了才冒，而且不许上一枚还挂着就再盖一张
-    if (_tbEmote <= 0 && !_bubble.Busy()) {
-        std::uniform_int_distribution<int> which(3, 4);   // 高兴 / 喜欢
-        ShowEmote(which(_rng), 2.6);
-        std::uniform_real_distribution<double> gap(TB_EMOTE_MIN_SEC, TB_EMOTE_MAX_SEC);
-        _tbEmote = gap(_rng);
     }
 
     std::uniform_real_distribution<double> pause(TB_PAUSE_MIN_SEC, TB_PAUSE_MAX_SEC);
@@ -704,7 +782,12 @@ void Runner::Move(double dt) {
     // "动不动"和"多快"是两件事，两处各判一遍早晚会对不上
     if (!Moving()) return;
 
-    const double speed = CurrentSpeedPx();
+    double speed = CurrentSpeedPx();
+    if (MouseMode() == 1 && (_state == State::Walk || _state == State::Run) && !IsNaN(_mouse) && dt > 0) {
+        const double remaining = (std::max)(0.0, BodyDistance(_mouse) -
+            (std::max)(0.0, Cfg().keepLen.valueOr(KEEP_LEN)) * BodyLen());
+        speed = (std::min)(speed, remaining / dt);
+    }
     if (_state == State::Run) _runTravel += speed * dt;
 
     _pos.x += DirDX()[_dir] * speed * dt;
@@ -743,7 +826,8 @@ void Runner::Move(double dt) {
 
     if (_state == State::Run) {
         // 逃跑途中撞墙不能交给随机反射，不然它挑一条朝鼠标的那条线，规则就毁了
-        SetDirection(BestFleeDir(_mouse));
+        if (MouseMode() == 0) SetDirection(BestFleeDir(_mouse));
+        else SetDirection((_dir + 4) % DIR_COUNT);
         _fleeForce = true;
         _fleeClock = 0.0;
         if (newBounce) Emit(GameEvent::BumpRun);
@@ -977,31 +1061,39 @@ void Runner::SeparateFrom(Runner* other) {
 // 这张表只回答"我长成什么样"，和遭遇表那张"我要不要理他"是两张表 ——
 // 混在一起，"追上去打"和"被打之后怎么挨"就会互相改写。
 //
-// 它不改血也不改伤害（这套程序本来就没有伤害），只管三件事：走哪段动画、
-// 往后退几个身长、换哪张脸。撞上墙那一推**不看这张表**，还是 wall knock
-// 那个数 —— 不然一定有人往 <react> 里加一行想调撞墙
+// 有效命中扣血并击退，XML 可调整反应动画、击退距离和表情。
 void Runner::Hit(Runner* attacker) {
     if (!attacker || !Targetable() || !attacker->Targetable() || !Opposed(_faction, attacker->_faction)) return;
     --_hp;
     ++_stats.hits;
     _targetId = 0;
+    const auto* reaction = MatchReaction(Cfg(), attacker->Name(), attacker->Id());
+    const auto me = BodyCenter(), from = attacker->BodyCenter();
+    double dx = me.x - from.x, dy = _opt.taskbar ? 0 : me.y - from.y;
+    double norm = std::hypot(dx, dy);
+    if (norm <= 0.01) {
+        // Overlapping actors recoil along the incoming attack direction.
+        dx = DirDX()[attacker->Dir()]; dy = _opt.taskbar ? 0 : DirDY()[attacker->Dir()];
+        if (_opt.taskbar && std::abs(dx) < 0.01) dx = 1;
+        norm = std::hypot(dx, dy);
+    }
+    const Vec2 away{dx / norm, dy / norm};
+    const double distance = (reaction && reaction->kbLen >= 0 ? reaction->kbLen : HIT_KB_LEN) * BodyLen();
+    // Retain the unapplied part of previous hits instead of dropping same-side
+    // hits during a hurt animation. Opposing impulses can naturally cancel.
+    const Vec2 pending{_knockUnit.x * _knockLeft + away.x * distance,
+                       _knockUnit.y * _knockLeft + away.y * distance};
+    _knockLeft = std::hypot(pending.x, pending.y);
+    _knockUnit = _knockLeft > 0 ? Vec2{pending.x / _knockLeft, pending.y / _knockLeft} : Vec2{};
     if (_hp <= 0) {
-        _hp = 0; _lifeAge = 0; _knockLeft = 0; _actionLeft = 0;
+        _hp = 0; _lifeAge = 0; _actionLeft = 0;
         HideEmote();
         BattleArt(Art::Kneel2, true, true);
         _state = _faction == Faction::Ally ? State::Stun : State::Dead;
     } else {
-        const auto* reaction = MatchReaction(Cfg(), attacker->Name(), attacker->Id());
         if (reaction && reaction->kind == ReactKind::None) return;
         const bool wasHit = _battleActive && _battleArt == Art::BeAttacked && _actionLeft > 0;
-        const auto me = BodyCenter(), from = attacker->BodyCenter();
-        const double dx = me.x - from.x, dy = _opt.taskbar ? 0 : me.y - from.y;
-        const double norm = std::hypot(dx, dy);
-        const int facing = DirToward(-dx, -dy);
-        if (!wasHit || facing != _dir) {
-            _knockUnit = norm > 0.01 ? Vec2{dx / norm, dy / norm} : Vec2{1, 0};
-            _knockLeft = (reaction && reaction->kbLen >= 0 ? reaction->kbLen : 1.0) * BodyLen();
-        }
+        const int facing = DirToward(-away.x, -away.y);
         SetDirection(facing);
         _lastHitter = attacker->EntityId();
         _actionLeft = IsEnemy() ? 2.0 : 0.35;
@@ -1661,6 +1753,7 @@ bool Runner::ShowEmote(int id, double seconds) {
     if (!_bubble.Create()) return false;
     if (!_bubble.Show(id, seconds)) return false;
     _lastEmoteId = id;
+    _randomEmoteAge = 0;
     return true;
 }
 

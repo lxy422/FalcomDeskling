@@ -170,7 +170,7 @@ constexpr double TB_ATTACK_FPS       = 10.0;
 constexpr double TB_VICTORY_FPS      = 6.0;
 // 挨一下往后推几个身长。xml 里 kbLen=-1 就回到这个数 —— 别拿 0 当"没写"，
 // 0 的意思真的是"一步都不退"
-constexpr double HIT_KB_LEN          = 1.0;
+constexpr double HIT_KB_LEN          = 0.5;
 // 同一个人多久才许再挨一下。没有这一条，两个人挤在一块会每拍推一次，
 // 看着就像在互相弹球
 constexpr double HIT_COOL_SEC        = 0.6;

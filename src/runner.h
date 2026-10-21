@@ -17,9 +17,7 @@ namespace fd {
 // GameEvent 是它的超集，名字也一样，不必再留一层别名。
 
 // 一个坐在桌面上乱走的人：位置、方向、状态机、撞墙挑向全在这儿。
-// 逻辑照搬 RunnerEntity.vb，只砍掉了 Phase 1 用不到的那几支（遭遇/跪姿）。
-// 武器这一档这轮只做手动开关，自动抽剑/收剑那套要等敌人系统，先不写。
-// 表情这轮只接已经有触发点的那几项，随机冒脸要等 character.xml 那张表。
+// 包含鼠标模式、自动休息、随机/事件表情、任务栏漫步和三阵营战斗。
 class Runner {
 public:
     struct Options {
@@ -114,7 +112,7 @@ public:
     bool Armed() const { return _armed; }
     bool IsEnemy() const { return EnemyFaction(_faction); }
     int Hp() const { return _hp; }
-    int MaxHp() const { return StartingHp(_faction); }
+    int MaxHp() const { return _maxHp; }
     bool Downed() const { return _hp <= 0; }
     bool Entering() const { return _enterLeft > 0; }
     bool Targetable() const { return !Downed() && !Entering(); }
@@ -270,6 +268,7 @@ private:
     Faction _faction = Faction::Ally;
     uint64_t _entityId = 0, _targetId = 0, _lastHitter = 0, _attacks = 0;
     int _hp = 10;
+    int _maxHp = 10;
     double _lifeAge = 0, _battleCool = 0, _actionLeft = 0, _disarmClock = 0;
     bool _battleActive = false, _battleOnce = false, _autoArmed = false;
     Art _battleArt = Art::Standby;
@@ -299,6 +298,11 @@ private:
     double StateHold(State st) const;
     void UpdateState(double dt, double dist);
     void UpdateFlee(double dt);
+    int MouseMode() const { return _opt.wander ? 2 : Cfg().mouseMode.valueOr(0); }
+    void UpdateApproach(double dt);
+    void UpdateRest(double dt, double distance);
+    void UpdateRandomEmote(double dt);
+    int PickRandomEmote(const std::vector<int>& pool);
     // 遭遇：这一拍桌上有没有该理的人，落在哪一档。躲和追都是"理"，
     // 所以这一趟只管挑出对象和档位，别在别处再判一遍距离
     void UpdateEncounter(double dt);
@@ -517,6 +521,10 @@ private:
     double _bounceCool = 0.0;
     double _dirLock = 0.0;
     double _touchCool = 0.0;
+    double _roamAge = 0.0;
+    double _farAge = 0.0;
+    double _randomEmoteAge = 0.0;
+    int _lastRandomEmote = 0;
     double _wanderClock = 0.0;
     double _fleeClock = 0.0;
     double _runTravel = 0.0;

@@ -35,8 +35,12 @@ if /i "%1"=="debug" set OPTS=/Od /Zi /MTd /DDEBUG
 if not exist "%OUT%\obj" mkdir "%OUT%\obj"
 if not exist "%OUT%\bin" mkdir "%OUT%\bin"
 
+echo [..] compiling icon resource
+rc /nologo /i resource /fo "%OUT%\obj\falcom.res" resource\falcom.rc
+if errorlevel 1 goto fail
+
 echo [..] compiling
-cl /nologo /std:c++17 /EHsc /utf-8 /W3 /DUNICODE /D_UNICODE %OPTS% /Fo"%OUT%\obj\\" "%SRC%\main.cpp" "%SRC%\display.cpp" "%SRC%\window.cpp" "%SRC%\wic.cpp" "%SRC%\runner.cpp" "%SRC%\combat.cpp" "%SRC%\tray.cpp" "%SRC%\store.cpp" "%SRC%\emote.cpp" "%SRC%\charconf.cpp" "%SRC%\xml.cpp" /link /SUBSYSTEM:WINDOWS /OUT:"%EXE%" user32.lib gdi32.lib shell32.lib windowscodecs.lib ole32.lib oleaut32.lib
+cl /nologo /std:c++17 /EHsc /utf-8 /W3 /DUNICODE /D_UNICODE %OPTS% /Fo"%OUT%\obj\\" "%SRC%\main.cpp" "%SRC%\display.cpp" "%SRC%\window.cpp" "%SRC%\wic.cpp" "%SRC%\runner.cpp" "%SRC%\combat.cpp" "%SRC%\tray.cpp" "%SRC%\store.cpp" "%SRC%\emote.cpp" "%SRC%\charconf.cpp" "%SRC%\xml.cpp" "%OUT%\obj\falcom.res" /link /SUBSYSTEM:WINDOWS /OUT:"%EXE%" user32.lib gdi32.lib shell32.lib windowscodecs.lib ole32.lib oleaut32.lib
 if errorlevel 1 goto fail
 
 if exist "resource\falcom.ico" copy /y "resource\falcom.ico" "%OUT%\bin\falcom.ico" >nul
@@ -66,6 +70,7 @@ rem Alternate output directories reuse the split resources beside the main build
 for %%c in (Enemy1 Enemy2) do if not exist "%OUT%\bin\%%c" if exist "%~dp0build\bin\%%c" mklink /J "%OUT%\bin\%%c" "%~dp0build\bin\%%c" >nul
 echo [OK] %EXE%
 if /i "%1"=="test" (
+  if not exist tests\regression.cpp goto notests
   cl /nologo /std:c++17 /EHsc /utf-8 /W3 /DUNICODE /D_UNICODE /O2 /MT /DNDEBUG /Fo"%OUT%\obj\regression.obj" tests\regression.cpp "%OUT%\obj\display.obj" "%OUT%\obj\runner.obj" "%OUT%\obj\combat.obj" "%OUT%\obj\window.obj" "%OUT%\obj\wic.obj" "%OUT%\obj\emote.obj" "%OUT%\obj\charconf.obj" "%OUT%\obj\xml.obj" "%OUT%\obj\store.obj" /link /SUBSYSTEM:CONSOLE /OUT:"%OUT%\bin\regression.exe" user32.lib gdi32.lib shell32.lib windowscodecs.lib ole32.lib oleaut32.lib psapi.lib
   if errorlevel 1 goto fail
   "%OUT%\bin\regression.exe" "%~dp0testdata\ChrBig"
@@ -95,5 +100,10 @@ exit /b 1
 
 :fail
 echo [X] build failed
+endlocal
+exit /b 1
+
+:notests
+echo [X] Local tests are not included in the public source checkout. Use build.cmd for a release build.
 endlocal
 exit /b 1
