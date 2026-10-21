@@ -3,6 +3,7 @@
 #include "display.h"
 #include "enemy.h"
 #include <set>
+#include <map>
 #include "charconf.h"
 #include "runner.h"
 #include "store.h"
@@ -41,6 +42,7 @@ struct Entity {
     std::unique_ptr<LayeredWindow> win;
     std::unique_ptr<Runner> runner;
     std::wstring name;
+    std::wstring skinDir;
     bool hasWeaponArt = false;
     HMONITOR monitor = nullptr;
 };
@@ -156,7 +158,10 @@ size_t FriendlyCount() {
 // 建一个角色：窗口 + Runner。失败就把自己收拾干净再回来，不留半个窗口
 bool AddEntity(const SkinInfo& si) {
     if (si.faction == Faction::Ally && ((int)FriendlyCount() >= g_maxEntities || (g_taskbar && FriendlyCount() > 0))) return false;
-    for (const auto& e : g_entities) if (e->runner->Name() == si.name && e->runner->MyFaction() == si.faction) return false;
+    size_t copies = 0;
+    for (const auto& e : g_entities) if (e->skinDir == si.dir && e->runner->MyFaction() == si.faction) ++copies;
+    const size_t limit = si.faction == Faction::Ally ? 1 : (size_t)(std::max)(1, si.RepeatLimit());
+    if (copies >= limit) return false;
 
     auto win = std::make_unique<LayeredWindow>();
     // 先按整格开一个尺寸，第一拍 Present 会照它自己那套皮肤的框 Resize 一次。
@@ -169,6 +174,7 @@ bool AddEntity(const SkinInfo& si) {
 
     auto e = std::make_unique<Entity>();
     e->name = si.name;
+    e->skinDir = si.dir;
     e->hasWeaponArt = si.hasStandby;
     e->monitor = g_spawnDisplay.handle;
     e->win = std::move(win);
@@ -353,19 +359,20 @@ void AddAll() {
 }
 
 void ClearEnemies() {
+    std::set<std::wstring> removed;
     for (auto it = g_entities.begin(); it != g_entities.end();) {
         if (!(*it)->runner->IsEnemy()) { ++it; continue; }
-        const auto name = (*it)->name;
+        removed.insert((*it)->skinDir);
         it = g_entities.erase(it);
-        for (const auto& skin : g_enemies) if (skin.name == name) StripCache::Shared().EvictSkin(skin.dir);
     }
+    for (const auto& dir : removed) StripCache::Shared().EvictSkin(dir);
     RebuildPeers(); g_enemySpawner.Clear();
 }
 
 bool AddEnemy(Faction faction = Faction::Unset, bool automatic = false) {
-    std::set<std::wstring> present;
-    for (const auto& e : g_entities) for (const auto& skin : g_enemies)
-        if (e->name == skin.name && e->runner->MyFaction() == skin.faction) present.insert(skin.dir);
+    std::map<std::wstring, size_t> present;
+    // Entry and death/fade windows still occupy a visible slot until removed.
+    for (const auto& e : g_entities) if (e->runner->IsEnemy()) ++present[e->skinDir];
     // Failed skins are remembered, so a bad file cannot monopolize each interval.
     for (size_t tries = 0; tries < g_enemies.size(); ++tries) {
         const int picked = g_enemySpawner.Pick(g_enemies, present, faction, automatic);
@@ -383,11 +390,15 @@ bool AddEnemy(Faction faction = Faction::Unset, bool automatic = false) {
 }
 
 void RemoveGoneEnemies() {
+    std::set<std::wstring> removed;
     for (auto it = g_entities.begin(); it != g_entities.end();) {
         if (!(*it)->runner->Gone()) { ++it; continue; }
-        const auto name = (*it)->name;
+        removed.insert((*it)->skinDir);
         it = g_entities.erase(it);
-        for (const auto& skin : g_enemies) if (skin.name == name) StripCache::Shared().EvictSkin(skin.dir);
+    }
+    for (const auto& dir : removed) {
+        const bool stillUsed = std::any_of(g_entities.begin(), g_entities.end(), [&](const auto& e) { return e->skinDir == dir; });
+        if (!stillUsed) StripCache::Shared().EvictSkin(dir);
     }
     RebuildPeers();
 }
@@ -1069,7 +1080,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     g_tray.canAdd = [] { return FriendlyCount() < (size_t)g_maxEntities && (!g_taskbar || FriendlyCount() == 0); };
     g_tray.onEnemyAdd = [](int which) {
         if (!AddEnemy(which == 1 ? Faction::Enemy1 : which == 2 ? Faction::Enemy2 : Faction::Unset))
-            MessageBoxW(g_msg, L"没有可加入的敌人。请确认 Enemy1 / Enemy2 素材完整，且未全部在场。", L"FalcomDeskling", MB_ICONINFORMATION);
+            MessageBoxW(g_msg, L"没有可加入的敌人。请检查 Enemy1 / Enemy2 素材完整性，以及 monster.xml 的重复出现设置和同屏上限。", L"FalcomDeskling", MB_ICONINFORMATION);
     };
     g_tray.onEnemyClear = [] { ClearEnemies(); };
     g_tray.enemyAuto = [] { return g_enemySpawner.Enabled(); };
@@ -1083,9 +1094,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         OutputDebugStringW(EmotionSheet::Shared().Fault().c_str());
     }
     if (g_emoteBoot > 0) ShowAllEmote(g_emoteBoot);
-    for (int i = 0; i < enemyBoot && i < (int)g_enemies.size(); ++i) if (!AddEnemy()) break;
-    for (int i = 0; i < enemy1Boot && i < (int)g_enemies.size(); ++i) if (!AddEnemy(Faction::Enemy1)) break;
-    for (int i = 0; i < enemy2Boot && i < (int)g_enemies.size(); ++i) if (!AddEnemy(Faction::Enemy2)) break;
+    for (int i = 0; i < enemyBoot; ++i) if (!AddEnemy()) break;
+    for (int i = 0; i < enemy1Boot; ++i) if (!AddEnemy(Faction::Enemy1)) break;
+    for (int i = 0; i < enemy2Boot; ++i) if (!AddEnemy(Faction::Enemy2)) break;
     if (std::isfinite(enemyAutoSec) && enemyAutoSec > 0) { g_enemySpawner.SetInterval(enemyAutoSec); g_enemySpawner.Enable(true); }
 
 

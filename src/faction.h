@@ -13,6 +13,7 @@ inline int TargetPriority(Faction self, Faction other) {
     return other == (self == Faction::Enemy2 ? Faction::Ally : Faction::Enemy2) ? 0 : 1;
 }
 inline int StartingHp(Faction f) { return f == Faction::Enemy2 ? 5 : 10; }
+inline int DefaultEnemyRepeat(Faction f) { return f == Faction::Enemy2 ? 4 : 1; }
 inline const wchar_t* FactionName(Faction f) {
     return f == Faction::Ally ? L"chr" : f == Faction::Enemy1 ? L"Enemy1" : f == Faction::Enemy2 ? L"Enemy2" : L"unset";
 }

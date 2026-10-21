@@ -1,6 +1,7 @@
 #include "store.h"
 #include "wic.h"
 #include "config.h"
+#include "charconf.h"
 #include <cwctype>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -210,6 +211,7 @@ std::vector<SkinInfo> ScanEnemyIndex() {
             SkinInfo skin;
             skin.name = name; skin.dir = it->path().wstring(); skin.id = number;
             skin.faction = faction; skin.hasStandby = true;
+            skin.enemyRepeat = ConfigFor(skin.dir, skin.id).enemyRepeat.valueOr(DefaultEnemyRepeat(faction));
             found.push_back(skin);
         }
     }

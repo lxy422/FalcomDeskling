@@ -45,6 +45,18 @@ bool GetInt(const XmlElem& e, const wchar_t* key, int& out) {
     return true;
 }
 
+bool GetBoundedInt(const XmlElem& e, const wchar_t* key, int minimum, int maximum, int& out) {
+    const auto* text = e.Attr(key);
+    if (!text) return false;
+    wchar_t* end = nullptr;
+    const double value = wcstod(text->c_str(), &end);
+    while (end && (*end == L' ' || *end == L'\t' || *end == L'\r' || *end == L'\n')) ++end;
+    if (end == text->c_str() || !end || *end || !std::isfinite(value) ||
+        value < minimum || value > maximum || std::floor(value) != value) return false;
+    out = (int)value;
+    return true;
+}
+
 bool GetBool(const XmlElem& e, const wchar_t* key, bool& out) {
     const std::wstring* v = e.Attr(key);
     if (!v) return false;
@@ -395,13 +407,16 @@ void ApplyCharacterXml(const XmlElem& root, CharacterConfig& c) {
     }
     if (const XmlElem* en = root.Kid(L"enemy")) {
         if (en->Has(L"hp")) {
-            const auto& text = *en->Attr(L"hp");
-            wchar_t* end = nullptr;
-            const double hp = wcstod(text.c_str(), &end);
-            while (end && (*end == L' ' || *end == L'\t' || *end == L'\r' || *end == L'\n')) ++end;
-            if (end != text.c_str() && end && !*end && std::isfinite(hp) && hp >= 1 && hp <= 1000000 && std::floor(hp) == hp) {
-                c.hp.Assign((int)hp); ++c.fields;
+            int hp = 0;
+            if (GetBoundedInt(*en, L"hp", 1, 1000000, hp)) {
+                c.hp.Assign(hp); ++c.fields;
             } else c.warnings.push_back(L"enemy hp 必须是 1 到 1000000 的整数，保留已有值或阵营默认值");
+        }
+        if (en->Has(L"repeat")) {
+            int repeat = 0;
+            if (GetBoundedInt(*en, L"repeat", 0, 1000000, repeat)) {
+                c.enemyRepeat.Assign(repeat); ++c.fields;
+            } else c.warnings.push_back(L"enemy repeat 必须是 0 到 1000000 的整数，保留已有值或阵营默认值");
         }
         for (const auto& kv : {std::pair{L"idleSec", &c.idleSec},
                                {L"disarmSec", &c.disarmSec}}) {
@@ -891,6 +906,7 @@ std::wstring DumpConfig(const CharacterConfig& c, const std::wstring& dir) {
     AppendOpt(s, L"restFarSec", c.restFarSec, REST_FAR_SEC, L"常量");
     AppendOpt(s, L"restDurationSec", c.restDurationSec, REST_DURATION_SEC, L"常量");
     AppendOpt(s, L"hp", c.hp, StartingHp(c.faction), L"阵营默认");
+    if (EnemyFaction(c.faction)) AppendOpt(s, L"enemyRepeat", c.enemyRepeat, DefaultEnemyRepeat(c.faction), L"阵营默认");
     AppendOpt(s, L"encNearLen", c.encNearLen, ENC_NEAR_LEN, L"常量");
     AppendOpt(s, L"encFarLen", c.encFarLen, ENC_FAR_LEN, L"常量");
     AppendOpt(s, L"attackLen", c.attackLen, ATTACK_LEN, L"常量");

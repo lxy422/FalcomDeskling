@@ -230,6 +230,7 @@ struct CharacterConfig {
 
     // 敌人的可配置 HP；未写时用阵营默认值，chr 始终为 10 HP。
     Opt<int> hp;
+    Opt<int> enemyRepeat; // 0=once per run; N>0=reusable, at most N simultaneous copies per skin
     Opt<double> idleSec;
     Opt<double> disarmSec;
 

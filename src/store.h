@@ -14,6 +14,8 @@ struct SkinInfo {
     bool hasStandby = false;   // false = 武器那两套不齐，托盘里要标出来
     int  id = 0;
     Faction faction = Faction::Ally;
+    int enemyRepeat = -1; // -1=camp default, 0=once, N>0=maximum simultaneous copies per skin
+    int RepeatLimit() const { return enemyRepeat < 0 ? DefaultEnemyRepeat(faction) : enemyRepeat; }
 };
 
 // ---- 资源住在哪儿 ----

@@ -2,6 +2,7 @@
 #include "store.h"
 #include <random>
 #include <set>
+#include <map>
 
 namespace fd {
 // One schedule and one appearance ledger shared by desktop/taskbar modes.
@@ -22,18 +23,24 @@ public:
     void Used(const SkinInfo& skin) { _used.insert(skin.dir); }
     void Invalid(const SkinInfo& skin) { _invalid.insert(skin.dir); }
     int Side(bool taskbar) { return std::uniform_int_distribution<int>(0, taskbar ? 1 : 3)(_rng); }
-    int Pick(const std::vector<SkinInfo>& skins, const std::set<std::wstring>& present,
+    int Pick(const std::vector<SkinInfo>& skins, const std::map<std::wstring, size_t>& present,
              Faction faction = Faction::Unset, bool automatic = false) {
-        std::vector<int> fresh, repeat;
+        std::vector<int> eligible;
+        bool canAppearLater = false;
         for (int i = 0; i < (int)skins.size(); ++i) {
             const auto& skin = skins[i];
-            if ((faction != Faction::Unset && skin.faction != faction) || present.count(skin.dir) || _invalid.count(skin.dir)) continue;
-            repeat.push_back(i);
-            if (!_used.count(skin.dir)) fresh.push_back(i);
+            if ((faction != Faction::Unset && skin.faction != faction) || _invalid.count(skin.dir)) continue;
+            const int limit = skin.RepeatLimit();
+            if (limit == 0 && _used.count(skin.dir)) continue;
+            canAppearLater = true;
+            const auto live = present.find(skin.dir);
+            const size_t count = live == present.end() ? 0 : live->second;
+            if (count < (size_t)(limit > 0 ? limit : 1)) eligible.push_back(i);
         }
-        if (automatic && fresh.empty()) { Enable(false); return -1; }
-        const auto& pool = fresh.empty() ? repeat : fresh;
-        return pool.empty() ? -1 : pool[std::uniform_int_distribution<int>(0, (int)pool.size() - 1)(_rng)];
+        // A full screen is temporary: keep auto enabled until slots free up.
+        // Only exhausted once-only skins (or invalid art) stop the schedule.
+        if (automatic && eligible.empty() && !canAppearLater) Enable(false);
+        return eligible.empty() ? -1 : eligible[std::uniform_int_distribution<int>(0, (int)eligible.size() - 1)(_rng)];
     }
 private:
     std::mt19937 _rng;
